@@ -32,6 +32,12 @@ console.log = function (...args) {
 };
 // ====================================================
 
+// 手机号脱敏函数 (提升到全局)
+function maskPhone(phone) {
+    if (!phone || phone.length < 8) return phone;
+    return phone.substring(0, 4) + '****' + phone.substring(phone.length - 4);
+}
+
 // ================= 基础配置与数据存储 =================
 const port = process.env.PORT || 3000;
 const dataFile = path.join(__dirname, "data.json");
@@ -261,6 +267,7 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
     let account = data.accounts.find(a => a.phone === accountPhone);
     if (!account) return;
 
+    const maskedPhone = maskPhone(account.phone);
     const now = Date.now();
     let botsToRun = [];
     
@@ -274,12 +281,12 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
     
     if (botsToRun.length === 0) return; 
 
-    addLog(`📱 [${account.phone}] 开始执行签到任务...`);
+    addLog(`📱 [${maskedPhone}] 开始执行签到任务...`);
     const client = new TelegramClient(new StringSession(account.session), data.settings.apiId, data.settings.apiHash, getDeviceConfig());
     
     try {
         await client.connect();
-        addLog(`✅ [${account.phone}] Telegram 连接成功！`);
+        addLog(`✅ [${maskedPhone}] Telegram 连接成功！`);
 
         for (let botObj of botsToRun) {
             const botUsername = botObj.username;
@@ -287,7 +294,7 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
 
             if (!isManual) {
                 const randomDelay = Math.floor(Math.random() * 20000) + 10000;
-                addLog(`[🤖 ${displayName}] ⏳ [${account.phone}] 准备签到，随机等待 ${(randomDelay/1000).toFixed(1)} 秒...`);
+                addLog(`[🤖 ${displayName}] ⏳ [${maskedPhone}] 准备签到，随机等待 ${(randomDelay/1000).toFixed(1)} 秒...`);
                 await sleep(randomDelay);
             }
 
@@ -295,7 +302,7 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
             try {
                 botEntity = await client.getEntity(botUsername);
             } catch (entityError) {
-                addLog(`[🤖 ${displayName}] ❌ [${account.phone}] 无法找到机器人 ${botUsername}，跳过。`);
+                addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 无法找到机器人 ${botUsername}，跳过。`);
                 continue; 
             }
 
@@ -352,7 +359,7 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                 const step = botObj.steps[i];
                 
                 if (step.type === 'send') {
-                    addLog(`[🤖 ${displayName}] 🚀 [${account.phone}] 发送: ${step.text}`);
+                    addLog(`[🤖 ${displayName}] 🚀 [${maskedPhone}] 发送: ${step.text}`);
                     await client.sendMessage(botEntity, { message: step.text });
                     
                     let sentMsgs = await client.getMessages(botEntity, { limit: 1 });
@@ -366,12 +373,12 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                     let lastBotMsg = messages.find(m => !m.out); 
 
                     if (lastBotMsg) {
-                        addLog(`[🤖 ${displayName}] ⏳ [${account.phone}] 尝试点击包含 [${step.text}] 的按钮...`);
+                        addLog(`[🤖 ${displayName}] ⏳ [${maskedPhone}] 尝试点击包含 [${step.text}] 的按钮...`);
                         let keywords = step.text.split(',').map(k => k.trim()).filter(k => k);
                         let clickRes = await clickButtonByKeywords(client, botEntity, lastBotMsg, keywords, displayName);
                         
                         if (!clickRes.clicked) {
-                            addLog(`[🤖 ${displayName}] ℹ️ [${account.phone}] 未找到匹配 [${step.text}] 的按钮，跳过此步。`);
+                            addLog(`[🤖 ${displayName}] ℹ️ [${maskedPhone}] 未找到匹配 [${step.text}] 的按钮，跳过此步。`);
                         } else {
                             if (clickRes.popupText) finalResultText = clickRes.popupText;
                             let msgText = await waitForBotResponse(15000);
@@ -382,7 +389,7 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                     }
                 }
                 else if (step.type === 'webapp' || step.type === 'webapp_json') {
-                    addLog(`[🤖 ${displayName}] ⏳ [${account.phone}] 正在请求小程序鉴权数据...`);
+                    addLog(`[🤖 ${displayName}] ⏳ [${maskedPhone}] 正在请求小程序鉴权数据...`);
                     try {
                         let targetWebAppUrl = step.type === 'webapp' ? step.webAppUrl : step.config.webAppUrl;
                         
@@ -423,7 +430,7 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                                 tgWebAppDataEncoded = match[1];
                                 tgWebAppDataDecoded = decodeURIComponent(match[1]);
                                 
-                                addLog(`[🤖 ${displayName}] ✅ [${account.phone}] 成功获取动态鉴权数据!`);
+                                addLog(`[🤖 ${displayName}] ✅ [${maskedPhone}] 成功获取动态鉴权数据!`);
                                 
                                 let fetchOptions = {};
                                 let apiUrl = "";
@@ -466,13 +473,13 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                                 const response = await fetch(apiUrl, fetchOptions);
                                 const resText = await response.text();
                                 finalResultText = resText;
-                                addLog(`[🤖 ${displayName}] 🎁 [${account.phone}] 小程序签到返回: ${resText.substring(0, 150)}`);
+                                addLog(`[🤖 ${displayName}] 🎁 [${maskedPhone}] 小程序签到返回: ${resText.substring(0, 150)}`);
                             } else {
-                                addLog(`[🤖 ${displayName}] ❌ [${account.phone}] 无法从返回的 URL 中提取 tgWebAppData`);
+                                addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 无法从返回的 URL 中提取 tgWebAppData`);
                             }
                         }
                     } catch (e) {
-                        addLog(`[🤖 ${displayName}] ❌ [${account.phone}] 小程序请求失败: ${e.message}`);
+                        addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 小程序请求失败: ${e.message}`);
                     }
                     let msgText = await waitForBotResponse(10000);
                     if (msgText) finalResultText = msgText;
@@ -519,13 +526,13 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
             saveData(data);
             
             const nextTimeStr = new Date(botObj.nextRunTime).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
-            addLog(`[🤖 ${displayName}] 📅 [${account.phone}] 下次执行时间已设定为: ${nextTimeStr}`);
+            addLog(`[🤖 ${displayName}] 📅 [${maskedPhone}] 下次执行时间已设定为: ${nextTimeStr}`);
         }
     } catch (error) {
-        addLog(`❌ [${account.phone}] 运行出错: ${error.message}`);
+        addLog(`❌ [${maskedPhone}] 运行出错: ${error.message}`);
     } finally {
         await client.destroy();
-        addLog(`🔌 [${account.phone}] 任务结束，已彻底断开连接。`);
+        addLog(`🔌 [${maskedPhone}] 任务结束，已彻底断开连接。`);
     }
 }
 
@@ -552,7 +559,7 @@ async function importSessionsFromEnv() {
             if (!data.accounts.find(a => a.phone === phone)) {
                 data.accounts.push({ phone: phone, session: sessionStr, bots: [] });
                 saveData(data);
-                addLog(`✅ 环境变量导入成功！识别到账号: ${phone}`);
+                addLog(`✅ 环境变量导入成功！识别到账号: ${maskPhone(phone)}`);
                 addedCount++;
             }
         } catch (error) {
@@ -562,12 +569,6 @@ async function importSessionsFromEnv() {
         }
     }
     if (addedCount > 0) addLog(`🎉 环境变量导入完成，共新增 ${addedCount} 个账号。`);
-}
-
-// 手机号脱敏函数
-function maskPhone(phone) {
-    if (!phone || phone.length < 8) return phone;
-    return phone.substring(0, 4) + '****' + phone.substring(phone.length - 4);
 }
 
 // ================= 渲染账号列表 HTML =================
@@ -863,7 +864,6 @@ app.get("/", (req, res) => {
 
                     e.preventDefault();
                     const submitBtn = form.querySelector('button[type="submit"]');
-                    // 修复：使用 innerHTML 替代 innerText，防止破坏按钮内部的 HTML 排版结构
                     const originalHTML = submitBtn.innerHTML;
                     const originalBg = submitBtn.style.background;
                     
@@ -1030,7 +1030,7 @@ app.post("/get-tg-code", async (req, res) => {
     const account = data.accounts.find(a => a.phone === phone);
     if (!account) return res.json({ success: false, error: "账号不存在" });
 
-    addLog(`[${phone}] 正在连接并获取官方登录验证码...`);
+    addLog(`[${maskPhone(phone)}] 正在连接并获取官方登录验证码...`);
     const client = new TelegramClient(new StringSession(account.session), data.settings.apiId, data.settings.apiHash, getDeviceConfig());
     
     try {
@@ -1039,13 +1039,13 @@ app.post("/get-tg-code", async (req, res) => {
         const messages = await client.getMessages(777000, { limit: 3 });
         if (messages.length > 0) {
             const latestMsg = messages[0].message;
-            addLog(`[${phone}] ✅ 成功获取验证码消息`);
+            addLog(`[${maskPhone(phone)}] ✅ 成功获取验证码消息`);
             res.json({ success: true, message: latestMsg });
         } else {
             res.json({ success: false, error: "未找到来自 Telegram 官方的消息，请确保验证码已发送" });
         }
     } catch (error) {
-        addLog(`[${phone}] ❌ 获取验证码失败: ${error.message}`);
+        addLog(`[${maskPhone(phone)}] ❌ 获取验证码失败: ${error.message}`);
         res.json({ success: false, error: error.message });
     } finally {
         await client.destroy();
@@ -1123,7 +1123,7 @@ app.post("/add-bot", (req, res) => {
                 lastSuccessTime: 0
             });
             saveData(data);
-            addLog(`➕ 账号 ${account.phone} 添加了机器人: ${customName}`);
+            addLog(`➕ 账号 ${maskPhone(account.phone)} 添加了机器人: ${customName}`);
         }
     }
     res.json({ success: true });
@@ -1135,7 +1135,7 @@ app.post("/remove-bot", (req, res) => {
     if (account) {
         account.bots = account.bots.filter(b => b.username !== req.body.bot);
         saveData(data);
-        addLog(`➖ 账号 ${account.phone} 移除了机器人: ${req.body.bot}`);
+        addLog(`➖ 账号 ${maskPhone(account.phone)} 移除了机器人: ${req.body.bot}`);
     }
     res.json({ success: true });
 });
@@ -1144,7 +1144,7 @@ app.post("/delete-account", (req, res) => {
     let data = loadData();
     data.accounts = data.accounts.filter(a => a.phone !== req.body.phone);
     saveData(data);
-    addLog(`🗑️ 已退出并删除账号: ${req.body.phone}`);
+    addLog(`🗑️ 已退出并删除账号: ${maskPhone(req.body.phone)}`);
     res.json({ success: true });
 });
 
@@ -1158,7 +1158,7 @@ app.post("/run-all", async (req, res) => {
 });
 
 app.post("/run-account", async (req, res) => {
-    addLog(`▶️ 手动触发了单账号签到任务: ${req.body.phone}！`);
+    addLog(`▶️ 手动触发了单账号签到任务: ${maskPhone(req.body.phone)}！`);
     res.json({ success: true });
     await runCheckinForAccount(req.body.phone, true);
 });
@@ -1184,7 +1184,7 @@ app.post("/login-session", async (req, res) => {
             data.accounts.push({ phone: phone, session: sessionStr, bots: [] });
             saveData(data);
         }
-        addLog(`✅ 密钥登录成功！识别到账号: ${phone}`);
+        addLog(`✅ 密钥登录成功！识别到账号: ${maskPhone(phone)}`);
         res.json({ success: true });
     } catch (error) {
         addLog(`❌ 密钥登录失败: ${error.message}`);
