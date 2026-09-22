@@ -1,0 +1,938 @@
+const { TelegramClient, Api } = require("telegram");
+const { StringSession } = require("telegram/sessions");
+const {
+    addLog,
+    maskPhone,
+    loadData,
+    saveData,
+    getDeviceConfig,
+    getNextRandomTime,
+    getRetryTime,
+    getBjDateString,
+    getDaysDiffBj
+} = require("./utils");
+
+const aiEndpoint = process.env.AI_ENDPOINT || process.env.OPENAI_BASE_URL || "";
+const aiKey = process.env.AI_KEY || process.env.OPENAI_API_KEY || "";
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const runningAccounts = new Set();
+
+function randomDelay(minMs, maxMs) {
+    const ms = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+    return sleep(ms);
+}
+
+async function callModel(endpoint, key, model, base64Image, options, timeoutMs) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(`${endpoint.replace(/\/$/, '')}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${key}`
+            },
+            body: JSON.stringify({
+                model: model,
+                messages: [
+                    {
+                        role: "user",
+                        content: [
+                            {
+                                type: "text",
+                                text: `这是一张验证图片。请从以下选项中选择一个最符合图片内容的选项。你必须只输出选项中的原文，不要包含任何其他文字、标点符号或解释。\n选项列表：${options.join(', ')}`
+                            },
+                            {
+                                type: "image_url",
+                                image_url: {
+                                    url: `data:image/jpeg;base64,${base64Image}`
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens: 50
+            }),
+            signal: controller.signal
+        });
+        clearTimeout(timeoutId);
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errText}`);
+        }
+        const resData = await response.json();
+        if (resData.choices && resData.choices[0] && resData.choices[0].message) {
+            return resData.choices[0].message.content.trim();
+        }
+        throw new Error("接口未返回有效 choices 数据");
+    } catch (e) {
+        clearTimeout(timeoutId);
+        throw e;
+    }
+}
+
+async function getBestAnswer(base64Image, options, aiSettings, botName) {
+    const models = [aiSettings.model1, aiSettings.model2, aiSettings.model3].filter(Boolean);
+    if (models.length === 0) {
+        addLog(`[🤖 ${botName}] ⚠️ 未配置任何 AI 模型`);
+        return null;
+    }
+
+    if (!aiEndpoint || !aiKey) {
+        addLog(`[🤖 ${botName}] ⚠️ 系统未配置环境变量 AI_ENDPOINT 或 AI_KEY`);
+        return null;
+    }
+
+    addLog(`[🤖 ${botName}] 🚀 正在向模型 [${models.join(', ')}] 发送并发请求...`);
+
+    const promises = models.map(model => 
+        callModel(aiEndpoint, aiKey, model, base64Image, options, 22000)
+        .then(ans => ({ model, ans, success: true }))
+        .catch(err => ({ model, err: err.message, success: false }))
+    );
+
+    const results = await Promise.all(promises);
+    
+    results.forEach(r => {
+        if (r.success) {
+            addLog(`[🤖 ${botName}] 💬 模型 [${r.model}] 返回: ${r.ans}`);
+        } else {
+            addLog(`[🤖 ${botName}] ❌ 模型 [${r.model}] 失败: ${r.err}`);
+        }
+    });
+
+    const validAnswers = results
+        .filter(r => r.success && r.ans)
+        .map(r => {
+            const cleaned = r.ans.trim().replace(/['"“”]/g, '');
+            return options.find(opt => cleaned.includes(opt) || opt.includes(cleaned)) || null;
+        })
+        .filter(Boolean);
+
+    if (validAnswers.length === 0) return null;
+
+    const counts = {};
+    let maxCount = 0;
+    let bestAns = validAnswers[0];
+    for (const ans of validAnswers) {
+        counts[ans] = (counts[ans] || 0) + 1;
+        if (counts[ans] > maxCount) {
+            maxCount = counts[ans];
+            bestAns = ans;
+        }
+    }
+    addLog(`[🤖 ${botName}] 🗳️ 投票统计: ${JSON.stringify(counts)} -> 最终选择: [${bestAns}]`);
+    return bestAns;
+}
+
+async function clickButtonByKeywords(client, peer, message, keywords, botName) {
+    if (!message.replyMarkup || !message.replyMarkup.rows) return { clicked: false, popupText: "" };
+    
+    for (const row of message.replyMarkup.rows) {
+        for (const button of row.buttons) {
+            if (button.text) {
+                for (const kw of keywords) {
+                    if (button.text.includes(kw)) {
+                        addLog(`[🤖 ${botName}] 👉 匹配到按钮: [${button.text}]，正在模拟点击...`);
+                        let popupText = "";
+                        
+                        try {
+                            let result = await client.invoke(new Api.messages.GetBotCallbackAnswer({
+                                peer: peer,
+                                msgId: message.id,
+                                data: button.data
+                            }));
+                            if (result && result.message) {
+                                popupText = result.message;
+                                addLog(`[🤖 ${botName}] 💬 收到按钮回复: ${popupText}`);
+                            } else {
+                                addLog(`[🤖 ${botName}] ✅ 按钮已点击`);
+                            }
+                        } catch (e) {
+                            if (e.message && (e.message.includes("BOT_RESPONSE_TIMEOUT") || e.message.includes("TIMEOUT"))) {
+                                addLog(`[🤖 ${botName}] ✅ 按钮已点击`);
+                            } else {
+                                addLog(`[🤖 ${botName}] ⚠️ 点击异常: ${e.message}`);
+                            }
+                        }
+                        return { clicked: true, popupText: popupText }; 
+                    }
+                }
+            }
+        }
+    }
+    return { clicked: false, popupText: "" };
+}
+
+async function markHistoryAsRead(client, botEntity, maxMsgId) {
+    if (!botEntity || !maxMsgId || typeof maxMsgId !== 'number' || maxMsgId <= 0) return;
+    try {
+        await client.invoke(new Api.messages.ReadHistory({
+            peer: botEntity,
+            maxId: maxMsgId
+        }));
+    } catch (e) {}
+}
+
+async function executeStepList(client, botEntity, steps, maskedPhone, displayName, checkKeywords, deviceConf, taskName = "签到") {
+    let latestHandledMsgId = 0;
+    let forceSuccess = false;
+    let finalResultText = "";
+
+    const waitForBotResponse = async (lastMsgId, lastText, lastMarkupStr, timeoutMs = 15000) => {
+        let startTime = Date.now();
+        while (Date.now() - startTime < timeoutMs) {
+            if (forceSuccess) return null;
+            await sleep(1000); 
+            let checkMsgs = await client.getMessages(botEntity, { limit: 5 });
+            let latestBotMsg = checkMsgs.find(m => !m.out);
+            
+            if (latestBotMsg) {
+                const currentMarkupStr = latestBotMsg.replyMarkup ? JSON.stringify(latestBotMsg.replyMarkup) : "";
+                const isNewMessage = latestBotMsg.id > lastMsgId;
+                const isMessageModified = latestBotMsg.id === lastMsgId && (latestBotMsg.text !== lastText || currentMarkupStr !== lastMarkupStr);
+
+                if (isNewMessage || isMessageModified) {
+                    latestHandledMsgId = Math.max(latestHandledMsgId, latestBotMsg.id);
+                    let text = latestBotMsg.text ? latestBotMsg.text.replace(/\n/g, '  ') : "[面板按钮已更新]";
+                    addLog(`[🤖 ${displayName}] 📩 收到新回复/消息面板更新: ${text}`);
+                    await markHistoryAsRead(client, botEntity, latestBotMsg.id);
+                    return { text: latestBotMsg.text || "", msg: latestBotMsg };
+                }
+            }
+        }
+        return null;
+    };
+
+    for (let i = 0; i < steps.length; i++) {
+        if (forceSuccess) break;
+        const step = steps[i];
+        
+        if (step.type === 'send' || step.type === 'send_delete') {
+            await randomDelay(2000, 4000);
+            const isDelete = (step.type === 'send_delete');
+            addLog(`[🤖 ${displayName}] 🚀 [${maskedPhone}] ${taskName}发送: ${step.text}${isDelete ? ' 将在 30 秒后撤回' : ''}`);
+            
+            let messagesBefore = await client.getMessages(botEntity, { limit: 5 });
+            let lastBotMsgBefore = messagesBefore.find(m => !m.out);
+            let lastMsgId = lastBotMsgBefore ? lastBotMsgBefore.id : 0;
+            let lastText = lastBotMsgBefore ? lastBotMsgBefore.text : "";
+            let lastMarkupStr = (lastBotMsgBefore && lastBotMsgBefore.replyMarkup) ? JSON.stringify(lastBotMsgBefore.replyMarkup) : "";
+
+            let startTime = Date.now();
+            let sentMsg = await client.sendMessage(botEntity, { message: step.text });
+            
+            let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 25000);
+            if (response) {
+                finalResultText = response.text;
+            } else {
+                finalResultText = "";
+            }
+
+            if (isDelete) {
+                let elapsed = Date.now() - startTime;
+                if (elapsed < 30000) {
+                    await sleep(30000 - elapsed);
+                }
+                try {
+                    if (sentMsg && sentMsg.id) {
+                        await client.deleteMessages(botEntity, [sentMsg.id], { revoke: true });
+                        addLog(`[🤖 ${displayName}] 🗑️ [${maskedPhone}] 已成功撤回发送的消息: ${step.text}`);
+                    }
+                } catch (delErr) {
+                    addLog(`[🤖 ${displayName}] ⚠️ 撤回消息失败: ${delErr.message}`);
+                }
+            }
+        } 
+        else if (step.type === 'click') {
+            await randomDelay(1500, 2500);
+            let messages = await client.getMessages(botEntity, { limit: 5 });
+            let lastBotMsg = messages.find(m => !m.out); 
+
+            if (lastBotMsg) {
+                latestHandledMsgId = Math.max(latestHandledMsgId, lastBotMsg.id);
+                let keywords = step.text.split(',').map(k => k.trim()).filter(k => k);
+                let clickRes = await clickButtonByKeywords(client, botEntity, lastBotMsg, keywords, displayName);
+                
+                if (!clickRes.clicked) {
+                    addLog(`[🤖 ${displayName}] ℹ️ [${maskedPhone}] 未找到匹配的按钮 [${step.text}]，跳过此步。`);
+                } else {
+                    let matchedPopup = false;
+                    if (clickRes.popupText && checkKeywords && checkKeywords.trim() !== "") {
+                        const kws = checkKeywords.split(',').map(k => k.trim()).filter(k => k);
+                        if (kws.length > 0 && kws.some(kw => clickRes.popupText.includes(kw))) {
+                            matchedPopup = true;
+                        }
+                    }
+
+                    if (matchedPopup) {
+                        addLog(`[🤖 ${displayName}] 🎯 弹窗回复匹配到检测关键词，立即判定成功。`);
+                        finalResultText = clickRes.popupText;
+                        forceSuccess = true;
+                        break;
+                    } else {
+                        let lastMsgId = lastBotMsg.id;
+                        let lastText = lastBotMsg.text;
+                        let lastMarkupStr = lastBotMsg.replyMarkup ? JSON.stringify(lastBotMsg.replyMarkup) : "";
+
+                        let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 12000);
+                        if (response) {
+                            finalResultText = response.text;
+                        } else if (clickRes.popupText) {
+                            addLog(`[🤖 ${displayName}] ℹ️ 未收到新消息，使用弹窗回复作为检测文本。`);
+                            finalResultText = clickRes.popupText;
+                        } else {
+                            finalResultText = "";
+                        }
+                    }
+                }
+            } else {
+                addLog(`[🤖 ${displayName}] ⚠️ 未找到历史消息，无法点击。`);
+            }
+        }
+        else if (step.type === 'ai_captcha') {
+            let messages = await client.getMessages(botEntity, { limit: 5 });
+            let lastBotMsg = messages.find(m => !m.out);
+            if (lastBotMsg && lastBotMsg.media && lastBotMsg.replyMarkup) {
+                latestHandledMsgId = Math.max(latestHandledMsgId, lastBotMsg.id);
+                addLog(`[🤖 ${displayName}] ⏳ [${maskedPhone}] 正在执行 AI 识别步骤...`);
+                const currentData = loadData();
+                const options = [];
+                if (lastBotMsg.replyMarkup.rows) {
+                    for (const row of lastBotMsg.replyMarkup.rows) {
+                        for (const btn of row.buttons) {
+                            if (btn.text) options.push(btn.text);
+                        }
+                    }
+                }
+                if (options.length > 1) {
+                    addLog(`[🤖 ${displayName}] 🔍 正在下载验证码图片并调用 AI 求解...`);
+                    try {
+                        const buffer = await client.downloadMedia(lastBotMsg.media);
+                        if (buffer) {
+                            const base64Image = buffer.toString('base64');
+                            addLog(`[🤖 ${displayName}] 📋 验证码选项: ${options.join(', ')}`);
+                            const bestAns = await getBestAnswer(base64Image, options, currentData.aiSettings, displayName);
+                            if (bestAns) {
+                                await randomDelay(1500, 3000);
+                                addLog(`[🤖 ${displayName}] 🎯 AI 选定答案: [${bestAns}]，正在模拟点击...`);
+                                let clickRes = await clickButtonByKeywords(client, botEntity, lastBotMsg, [bestAns], displayName);
+                                
+                                let matchedPopup = false;
+                                if (clickRes.popupText && checkKeywords && checkKeywords.trim() !== "") {
+                                    const kws = checkKeywords.split(',').map(k => k.trim()).filter(k => k);
+                                    if (kws.length > 0 && kws.some(kw => clickRes.popupText.includes(kw))) {
+                                        matchedPopup = true;
+                                    }
+                                }
+
+                                if (matchedPopup) {
+                                    addLog(`[🤖 ${displayName}] 🎯 弹窗回复匹配到检测关键词，立即判定成功。`);
+                                    finalResultText = clickRes.popupText;
+                                    forceSuccess = true;
+                                    break;
+                                } else {
+                                    let lastMsgId = lastBotMsg.id;
+                                    let lastText = lastBotMsg.text;
+                                    let lastMarkupStr = JSON.stringify(lastBotMsg.replyMarkup);
+
+                                    let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 25000);
+                                    if (response) {
+                                        finalResultText = response.text;
+                                    } else if (clickRes.popupText) {
+                                        addLog(`[🤖 ${displayName}] ℹ️ 未收到新消息，使用弹窗回复作为检测文本。`);
+                                        finalResultText = clickRes.popupText;
+                                    } else {
+                                        finalResultText = "";
+                                    }
+                                }
+                            } else {
+                                addLog(`[🤖 ${displayName}] ❌ AI 未能给出有效答案`);
+                            }
+                        }
+                    } catch (err) {
+                        addLog(`[🤖 ${displayName}] ❌ AI 识别步骤失败: ${err.message}`);
+                    }
+                } else {
+                    addLog(`[🤖 ${displayName}] ⚠️ 验证码选项不足，跳过 AI 识别`);
+                }
+            } else {
+                addLog(`[🤖 ${displayName}] ⚠️ 未找到包含媒体 and 按钮的最新消息，无法执行 AI 识别`);
+            }
+        }
+        else if (step.type === 'webapp' || step.type === 'webapp_json') {
+            addLog(`[🤖 ${displayName}] ⏳ [${maskedPhone}] 正在请求小程序鉴权数据...`);
+            try {
+                let targetWebAppUrl = step.type === 'webapp' ? step.webAppUrl : step.config.webAppUrl;
+                
+                const themeParams = new Api.DataJSON({
+                    data: JSON.stringify({
+                        "bg_color": "#ffffff",
+                        "text_color": "#000000",
+                        "hint_color": "#707579",
+                        "link_color": "#3390ec",
+                        "button_color": "#3390ec",
+                        "button_text_color": "#ffffff",
+                        "secondary_bg_color": "#f4f4f5",
+                        "header_bg_color": "#ffffff",
+                        "bottom_bar_bg_color": "#ffffff",
+                        "accent_text_color": "#3390ec",
+                        "section_bg_color": "#ffffff",
+                        "section_header_text_color": "#3390ec",
+                        "subtitle_text_color": "#707579",
+                        "destructive_text_color": "#df3f40"
+                    })
+                });
+
+                const webViewResult = await client.invoke(new Api.messages.RequestWebView({
+                    peer: botEntity,
+                    bot: botEntity,
+                    platform: deviceConf.platform,
+                    fromBotMenu: false,
+                    url: targetWebAppUrl,
+                    themeParams: themeParams
+                }));
+                
+                if (webViewResult && webViewResult.url) {
+                    let tgWebAppDataEncoded = "";
+                    let tgWebAppDataDecoded = "";
+                    const match = webViewResult.url.match(/tgWebAppData=([^&]+)/);
+                    
+                    if (match && match[1]) {
+                        tgWebAppDataEncoded = match[1];
+                        tgWebAppDataDecoded = decodeURIComponent(match[1]);
+                        
+                        addLog(`[🤖 ${displayName}] ✅ [${maskedPhone}] 成功获取动态鉴权数据!`);
+                        
+                        let fetchOptions = {};
+                        let apiUrl = "";
+
+                        if (step.type === 'webapp_json') {
+                            const replaceVars = (obj) => {
+                                if (typeof obj === 'string') {
+                                    return obj.replace(/\{\{tgWebAppData\}\}/g, tgWebAppDataEncoded)
+                                              .replace(/\{\{tgWebAppData_decoded\}\}/g, tgWebAppDataDecoded);
+                                } else if (Array.isArray(obj)) {
+                                    return obj.map(replaceVars);
+                                } else if (typeof obj === 'object' && obj !== null) {
+                                    let res = {};
+                                    for (let k in obj) res[k] = replaceVars(obj[k]);
+                                    return res;
+                                }
+                                return obj;
+                            };
+
+                            let finalConfig = replaceVars(step.config);
+                            apiUrl = finalConfig.apiUrl;
+                            const customHeaders = finalConfig.headers || {};
+                            if (!customHeaders['User-Agent'] && !customHeaders['user-agent']) {
+                                customHeaders['User-Agent'] = deviceConf.userAgent;
+                            }
+                            fetchOptions = {
+                                method: finalConfig.method || 'POST',
+                                headers: customHeaders,
+                                body: finalConfig.body ? (typeof finalConfig.body === 'string' ? finalConfig.body : JSON.stringify(finalConfig.body)) : undefined
+                            };
+                        } else {
+                            apiUrl = step.apiUrl;
+                            fetchOptions = {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Authorization': `Bearer ${tgWebAppDataDecoded}`,
+                                    'User-Agent': deviceConf.userAgent
+                                },
+                                body: JSON.stringify({ action: 'checkin', tgWebAppData: tgWebAppDataDecoded })
+                            };
+                        }
+                        
+                        await randomDelay(2000, 4000);
+                        const response = await fetch(apiUrl, fetchOptions);
+                        const resText = await response.text();
+                        finalResultText = resText;
+                        addLog(`[🤖 ${displayName}] 🎁 [${maskedPhone}] 小程序返回: ${resText.substring(0, 150)}`);
+                    } else {
+                        addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 无法从返回 URL 中提取 tgWebAppData`);
+                    }
+                }
+            } catch (e) {
+                addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 小程序请求失败: ${e.message}`);
+            }
+        }
+    }
+
+    if (latestHandledMsgId > 0) {
+        await markHistoryAsRead(client, botEntity, latestHandledMsgId);
+    }
+
+    let isSuccess = true;
+    if (forceSuccess) {
+        isSuccess = true;
+    } else {
+        if (checkKeywords && checkKeywords.trim() !== "") {
+            const kws = checkKeywords.split(',').map(k => k.trim()).filter(k => k);
+            if (kws.length > 0) {
+                isSuccess = kws.some(kw => finalResultText.includes(kw));
+            }
+        }
+    }
+
+    return { isSuccess, finalResultText };
+}
+
+async function simulateBrowseChannelOrIdle(client, maskedPhone, durationMs = 300000) {
+    const startTime = Date.now();
+    try {
+        await client.invoke(new Api.account.UpdateStatus({ offline: false }));
+    } catch (e) {}
+
+    let chosenChannel = null;
+    let chosenTitle = "";
+
+    try {
+        const dialogs = await client.getDialogs({ limit: 30 });
+        const channels = dialogs.filter(d => d.isChannel && d.entity);
+        if (channels.length > 0) {
+            chosenChannel = channels[Math.floor(Math.random() * channels.length)];
+            chosenTitle = chosenChannel.title || chosenChannel.name || "已加入频道";
+            addLog(`📱 [${maskedPhone}] 随机进入频道 [${chosenTitle}] 模拟阅读 5 分钟...`);
+        } else {
+            addLog(`📱 [${maskedPhone}] 未检测到已加入的频道，切换为在线保持 5 分钟...`);
+        }
+    } catch (e) {
+        addLog(`📱 [${maskedPhone}] 获取对话列表失败，切换为在线保持 5 分钟: ${e.message}`);
+    }
+
+    while (Date.now() - startTime < durationMs) {
+        const remainingMs = durationMs - (Date.now() - startTime);
+        if (remainingMs <= 0) break;
+        const stepMs = Math.min(remainingMs, Math.floor(Math.random() * 15000) + 35000);
+        await sleep(stepMs);
+
+        try {
+            await client.invoke(new Api.account.UpdateStatus({ offline: false }));
+        } catch (e) {}
+
+        if (chosenChannel && chosenChannel.entity) {
+            try {
+                const msgs = await client.getMessages(chosenChannel.entity, { limit: 10 });
+                if (msgs && msgs.length > 0) {
+                    const topMsg = msgs[0];
+                    if (topMsg && topMsg.id) {
+                        await client.invoke(new Api.channels.ReadHistory({
+                            channel: chosenChannel.entity,
+                            maxId: topMsg.id
+                        }));
+                    }
+                }
+            } catch (e) {}
+        }
+    }
+    addLog(`🌱 [${maskedPhone}] 已成功完成 5 分钟在线与浏览，准备断开连接。`);
+}
+
+async function runCheckinForAccount(accountPhone, isManual = false, targetBotUsername = null) {
+    let data = loadData();
+    let account = data.accounts.find(a => a.phone === accountPhone);
+    if (!account) return;
+
+    const maskedPhone = maskPhone(account.phone);
+    if (runningAccounts.has(accountPhone)) {
+        if (isManual) {
+            addLog(`📱 [${maskedPhone}] 任务已在运行中，跳过重复执行。`);
+        }
+        return;
+    }
+    runningAccounts.add(accountPhone);
+
+    const now = Date.now();
+    let botsToRun = data.bots.filter(b => b.enabledAccounts && b.enabledAccounts.includes(accountPhone));
+    
+    if (targetBotUsername) {
+        botsToRun = botsToRun.filter(b => b.username === targetBotUsername);
+    } else if (isManual) {
+    } else {
+        botsToRun = botsToRun.filter(b => {
+            const state = b.states && b.states[accountPhone];
+            const nextRunTime = state ? state.nextRunTime : 0;
+            return now >= nextRunTime;
+        });
+    }
+    
+    if (botsToRun.length === 0) {
+        runningAccounts.delete(accountPhone);
+        return;
+    }
+
+    const apiId = Number(data.settings.apiId);
+    if (!Number.isInteger(apiId) || apiId <= 0) {
+        addLog(`❌ [${maskedPhone}] Telegram API ID 配置无效: ${data.settings.apiId}`);
+        runningAccounts.delete(accountPhone);
+        return;
+    }
+
+    const deviceConf = getDeviceConfig(account.phone);
+    addLog(`📱 [${maskedPhone}] 开始执行任务，当前设备环境: ${deviceConf.deviceModel}`);
+    const client = new TelegramClient(new StringSession(account.session), apiId, data.settings.apiHash, deviceConf);
+    
+    try {
+        await client.connect();
+        try {
+            await client.invoke(new Api.account.UpdateStatus({ offline: false }));
+        } catch (e) {}
+        addLog(`✅ [${maskedPhone}] Telegram 连接成功！`);
+
+        for (let bIdx = 0; bIdx < botsToRun.length; bIdx++) {
+            if (bIdx > 0) {
+                await randomDelay(3000, 6000);
+            }
+
+            const botObj = botsToRun[bIdx];
+            const botUsername = botObj.username;
+            const displayName = botObj.name; 
+            const state = botObj.states[accountPhone];
+            const checkinInterval = botObj.checkinIntervalDays || 1;
+
+            const todayBj = getBjDateString();
+            if (state.lastRetryDate !== todayBj) {
+                state.todayRetryCount = 0;
+                state.lastRetryDate = todayBj;
+            }
+
+            let botEntity;
+            try {
+                botEntity = await client.getEntity(botUsername);
+            } catch (entityError) {
+                addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 无法找到机器人 ${botUsername}。`);
+                state.todayRetryCount = (state.todayRetryCount || 0) + 1;
+                state.lastStatus = 'fail';
+                
+                const nowBjTime = new Date(Date.now() + 8 * 60 * 60 * 1000);
+                const isAfter2330Bj = (nowBjTime.getUTCHours() === 23 && nowBjTime.getUTCMinutes() >= 30);
+                
+                if (state.todayRetryCount >= 2 || isAfter2330Bj) {
+                    state.retryCount = 0;
+                    state.nextRunTime = getNextRandomTime(checkinInterval);
+                } else {
+                    state.retryCount = 0;
+                    state.nextRunTime = getRetryTime();
+                }
+                
+                data = loadData();
+                let botIndex = data.bots.findIndex(b => b.username === botUsername);
+                if (botIndex !== -1) {
+                    data.bots[botIndex].states[accountPhone] = state;
+                    saveData(data);
+                }
+                
+                const nextTimeStr = new Date(state.nextRunTime).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+                addLog(`[🤖 ${displayName}] 📅 [${maskedPhone}] 下次执行时间已设定为: ${nextTimeStr}`);
+                continue; 
+            }
+
+            const lastSuccessBj = state.lastSuccessTime ? getBjDateString(state.lastSuccessTime) : "";
+            let isCheckinSuccess = (todayBj === lastSuccessBj);
+            let skipCheckinSteps = isCheckinSuccess;
+
+            if (!skipCheckinSteps && state.todayRetryCount > 0 && botObj.checkKeywords && botObj.checkKeywords.trim() !== "") {
+                try {
+                    let preCheckMessages = await client.getMessages(botEntity, { limit: 5 });
+                    let lastOutMsg = preCheckMessages.find(m => m.out);
+                    if (lastOutMsg) {
+                        let botReplies = preCheckMessages.filter(m => !m.out && m.id > lastOutMsg.id);
+                        const kws = botObj.checkKeywords.split(',').map(k => k.trim()).filter(k => k);
+                        
+                        const nowBj = new Date(Date.now() + 8 * 60 * 60 * 1000);
+                        const todayStartBjMs = Date.UTC(nowBj.getUTCFullYear(), nowBj.getUTCMonth(), nowBj.getUTCDate(), 0, 0, 0);
+                        const todayStartMs = todayStartBjMs - 8 * 60 * 60 * 1000;
+                        const todayStartSec = Math.floor(todayStartMs / 1000);
+
+                        let matchedReply = botReplies.find(reply => {
+                            if (reply.text && reply.date >= todayStartSec) {
+                                return kws.some(kw => reply.text.includes(kw));
+                            }
+                            return false;
+                        });
+
+                        if (matchedReply) {
+                            addLog(`[🤖 ${displayName}] 🔍 预检发现今日已在后台签到成功，跳过签到步骤。`);
+                            state.lastSuccessTime = matchedReply.date * 1000;
+                            isCheckinSuccess = true;
+                            skipCheckinSteps = true;
+                            await markHistoryAsRead(client, botEntity, matchedReply.id);
+                        }
+                    }
+                } catch (preCheckErr) {
+                    addLog(`[🤖 ${displayName}] ⚠️ 预检过程出错: ${preCheckErr.message}`);
+                }
+            }
+
+            if (state.todayRetryCount >= 2) {
+                addLog(`[🤖 ${displayName}] ⚠️ 今日已达到重试上限(2次)，推迟至明日再次尝试。`);
+                state.nextRunTime = getNextRandomTime(1);
+                data = loadData();
+                let botIndex = data.bots.findIndex(b => b.username === botUsername);
+                if (botIndex !== -1) {
+                    data.bots[botIndex].states[accountPhone] = state;
+                    saveData(data);
+                }
+                const nextTimeStr = new Date(state.nextRunTime).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+                addLog(`[🤖 ${displayName}] 📅 [${maskedPhone}] 下次执行时间已设定为: ${nextTimeStr}`);
+                continue;
+            }
+
+            state.todayRetryCount = (state.todayRetryCount || 0) + 1;
+
+            if (!skipCheckinSteps) {
+                if (state.todayRetryCount === 1) {
+                    addLog(`[🤖 ${displayName}] 🚀 开始执行签到...`);
+                } else {
+                    addLog(`[🤖 ${displayName}] 🚀 开始执行签到 重试...`);
+                }
+                const checkinResult = await executeStepList(client, botEntity, botObj.steps, maskedPhone, displayName, botObj.checkKeywords, deviceConf, "签到");
+                isCheckinSuccess = checkinResult.isSuccess;
+            }
+
+            const nowBjTime = new Date(Date.now() + 8 * 60 * 60 * 1000);
+            const isAfter2330Bj = (nowBjTime.getUTCHours() === 23 && nowBjTime.getUTCMinutes() >= 30);
+
+            if (!isCheckinSuccess) {
+                state.lastStatus = 'fail';
+                if (state.todayRetryCount >= 2) {
+                    state.retryCount = 0;
+                    state.nextRunTime = getNextRandomTime(checkinInterval);
+                    addLog(`[🤖 ${displayName}] ❌ 今日签到重试已失败，推迟至下次周期。`);
+                } else if (isAfter2330Bj) {
+                    state.retryCount = 0;
+                    state.nextRunTime = getNextRandomTime(checkinInterval);
+                    addLog(`[🤖 ${displayName}] ❌ 签到在 23:30 后失败，跳过重试并推迟。`);
+                } else {
+                    state.retryCount = 0; 
+                    state.nextRunTime = getRetryTime(); 
+                    addLog(`[🤖 ${displayName}] ❌ 签到失败，已安排重试。`);
+                }
+            } else {
+                state.lastSuccessTime = Date.now();
+                addLog(`[🤖 ${displayName}] ✅ 签到确认成功！`);
+
+                const renewInterval = parseInt(botObj.renewIntervalDays) || 0;
+                const hasRenewConfig = renewInterval > 0 && Array.isArray(botObj.renewSteps) && botObj.renewSteps.length > 0;
+                const daysSinceRenew = getDaysDiffBj(state.lastRenewDate, todayBj);
+                const needRenewToday = hasRenewConfig && (daysSinceRenew >= renewInterval);
+
+                if (!needRenewToday) {
+                    if (hasRenewConfig) {
+                        addLog(`[🤖 ${displayName}] ℹ️ [${maskedPhone}] 距上次续费(${state.lastRenewDate || '未记录'})已有 ${daysSinceRenew} 天，未达续费周期 ${renewInterval} 天，跳过续费。`);
+                    }
+                    state.retryCount = 0;
+                    state.todayRetryCount = 0;
+                    state.lastStatus = 'success';
+                    state.nextRunTime = getNextRandomTime(checkinInterval);
+                } else {
+                    addLog(`[🤖 ${displayName}] 🔄 [${maskedPhone}] 满足续费条件(距上次续费 ${daysSinceRenew} 天 / 设定周期 ${renewInterval} 天)，开始执行自动续费...`);
+                    await randomDelay(2500, 4500);
+                    const renewResult = await executeStepList(client, botEntity, botObj.renewSteps, maskedPhone, displayName, botObj.checkKeywords, deviceConf, "续费");
+                    
+                    if (renewResult.isSuccess) {
+                        state.lastRenewDate = todayBj;
+                        state.lastRenewStatus = 'success';
+                        state.retryCount = 0;
+                        state.todayRetryCount = 0;
+                        state.lastStatus = 'success';
+                        state.nextRunTime = getNextRandomTime(checkinInterval);
+                        addLog(`[🤖 ${displayName}] 🌟 [${maskedPhone}] 自动续费执行成功，记录本次续费日期: ${todayBj}`);
+                    } else {
+                        state.lastStatus = 'fail';
+                        state.lastRenewStatus = 'fail';
+                        addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 自动续费失败，准备安排重试...`);
+                        if (state.todayRetryCount >= 2) {
+                            state.retryCount = 0;
+                            state.nextRunTime = getNextRandomTime(1);
+                            addLog(`[🤖 ${displayName}] ⚠️ 今日续费重试已达上限，推迟至明天再次尝试。`);
+                        } else if (isAfter2330Bj) {
+                            state.retryCount = 0;
+                            state.nextRunTime = getNextRandomTime(1);
+                            addLog(`[🤖 ${displayName}] ⚠️ 超过 23:30，推迟至明天再次尝试续费。`);
+                        } else {
+                            state.retryCount = 0;
+                            state.nextRunTime = getRetryTime();
+                            addLog(`[🤖 ${displayName}] 📅 已安排今日稍后重试续费。`);
+                        }
+                    }
+                }
+            }
+            
+            data = loadData();
+            let botIndex = data.bots.findIndex(b => b.username === botUsername);
+            if (botIndex !== -1) {
+                data.bots[botIndex].states[accountPhone] = state;
+                saveData(data);
+            }
+            
+            const nextTimeStr = new Date(state.nextRunTime).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+            addLog(`[🤖 ${displayName}] 📅 [${maskedPhone}] 下次执行时间已设定为: ${nextTimeStr}`);
+        }
+
+        await simulateBrowseChannelOrIdle(client, maskedPhone, 300000);
+
+    } catch (error) {
+        addLog(`❌ [${maskedPhone}] 运行出错: ${error.message}`);
+        const errStr = String(error.message || error);
+        data = loadData();
+        if (errStr.includes("AUTH_KEY_UNREGISTERED") || errStr.includes("USER_DEACTIVATED") || errStr.includes("SESSION_REVOKED") || errStr.includes("PHONE_NUMBER_BANNED")) {
+            addLog(`🚨 [${maskedPhone}] 检测到账号已被封禁或 Session 已失效，已自动推迟该账号所有任务 24 小时。`);
+            const longNextTime = Date.now() + 24 * 60 * 60 * 1000;
+            data.bots.forEach(b => {
+                if (b.states && b.states[accountPhone]) {
+                    b.states[accountPhone].nextRunTime = longNextTime;
+                    b.states[accountPhone].lastStatus = 'fail';
+                }
+            });
+            saveData(data);
+        } else {
+            const retryTime = getRetryTime();
+            data.bots.forEach(b => {
+                if (b.states && b.states[accountPhone]) {
+                    b.states[accountPhone].nextRunTime = retryTime;
+                    b.states[accountPhone].lastStatus = 'fail';
+                }
+            });
+            saveData(data);
+        }
+    } finally {
+        try {
+            await client.destroy();
+        } catch (e) {}
+        runningAccounts.delete(accountPhone);
+        addLog(`🔌 [${maskedPhone}] 任务结束，已彻底断开连接。`);
+    }
+}
+
+async function runRenewForAccount(accountPhone, targetBotUsername) {
+    let data = loadData();
+    let account = data.accounts.find(a => a.phone === accountPhone);
+    if (!account) return;
+
+    const maskedPhone = maskPhone(account.phone);
+    if (runningAccounts.has(accountPhone)) {
+        addLog(`📱 [${maskedPhone}] 任务已在运行中，跳过续费测试。`);
+        return;
+    }
+    runningAccounts.add(accountPhone);
+
+    const botObj = data.bots.find(b => b.username === targetBotUsername);
+    if (!botObj) {
+        addLog(`❌ [${maskedPhone}] 机器人不存在: ${targetBotUsername}`);
+        runningAccounts.delete(accountPhone);
+        return;
+    }
+
+    if (!Array.isArray(botObj.renewSteps) || botObj.renewSteps.length === 0) {
+        addLog(`[🤖 ${botObj.name}] ⚠️ [${maskedPhone}] 尚未配置续费步骤，无法执行续费测试。`);
+        runningAccounts.delete(accountPhone);
+        return;
+    }
+
+    const apiId = Number(data.settings.apiId);
+    if (!Number.isInteger(apiId) || apiId <= 0) {
+        addLog(`❌ [${maskedPhone}] Telegram API ID 配置无效`);
+        runningAccounts.delete(accountPhone);
+        return;
+    }
+
+    const deviceConf = getDeviceConfig(account.phone);
+    addLog(`📱 [${maskedPhone}] 开始执行独立续费测试...`);
+    const client = new TelegramClient(new StringSession(account.session), apiId, data.settings.apiHash, deviceConf);
+
+    try {
+        await client.connect();
+        const botEntity = await client.getEntity(botObj.username);
+        const renewResult = await executeStepList(client, botEntity, botObj.renewSteps, maskedPhone, botObj.name, botObj.checkKeywords, deviceConf, "续费测试");
+        
+        const todayBj = getBjDateString();
+        data = loadData();
+        let bIdx = data.bots.findIndex(b => b.username === botObj.username);
+        if (bIdx !== -1) {
+            if (!data.bots[bIdx].states[accountPhone]) {
+                data.bots[bIdx].states[accountPhone] = {
+                    nextRunTime: getNextRandomTime(data.bots[bIdx].checkinIntervalDays || 1),
+                    retryCount: 0,
+                    todayRetryCount: 0,
+                    lastRetryDate: "",
+                    lastStatus: 'pending',
+                    lastSuccessTime: 0,
+                    lastRenewDate: "",
+                    lastRenewStatus: 'pending'
+                };
+            }
+            if (renewResult.isSuccess) {
+                data.bots[bIdx].states[accountPhone].lastRenewDate = todayBj;
+                data.bots[bIdx].states[accountPhone].lastRenewStatus = 'success';
+                addLog(`[🤖 ${botObj.name}] 🌟 [${maskedPhone}] 续费测试执行成功，已更新续费日期为: ${todayBj}`);
+            } else {
+                data.bots[bIdx].states[accountPhone].lastRenewStatus = 'fail';
+                addLog(`[🤖 ${botObj.name}] ⚠️ [${maskedPhone}] 续费测试未匹配检测关键词或未确认成功`);
+            }
+            saveData(data);
+        }
+    } catch (err) {
+        addLog(`[🤖 ${botObj.name}] ❌ [${maskedPhone}] 续费测试失败: ${err.message}`);
+    } finally {
+        try {
+            await client.destroy();
+        } catch (e) {}
+        runningAccounts.delete(accountPhone);
+        addLog(`🔌 [${maskedPhone}] 续费测试连接已释放。`);
+    }
+}
+
+async function importSessionsFromEnv() {
+    const envSessionsStr = process.env.TG_SESSIONS;
+    if (!envSessionsStr) return;
+
+    const sessions = envSessionsStr.split(/[\n,]+/).map(s => s.trim()).filter(s => s);
+    if (sessions.length === 0) return;
+
+    let data = loadData();
+    let addedCount = 0;
+
+    for (const sessionStr of sessions) {
+        if (data.accounts.find(a => a.session === sessionStr)) continue;
+
+        const apiId = Number(data.settings.apiId);
+        if (!Number.isInteger(apiId) || apiId <= 0) {
+            addLog(`❌ 环境变量导入失败: Telegram API ID 配置无效`);
+            continue;
+        }
+
+        addLog(`🔄 正在从环境变量导入新的 Session...`);
+        const tempClient = new TelegramClient(new StringSession(sessionStr), apiId, data.settings.apiHash, getDeviceConfig());
+        try {
+            await tempClient.connect();
+            const me = await tempClient.getMe();
+            const phone = "+" + me.phone;
+            
+            data = loadData();
+            if (!data.accounts.find(a => a.phone === phone)) {
+                const devConf = getDeviceConfig(phone);
+                data.accounts.push({ phone: phone, session: sessionStr, deviceIndex: devConf.deviceIndex });
+                saveData(data);
+                addLog(`✅ 环境变量导入成功！识别到账号: ${maskPhone(phone)}，分配环境: ${devConf.deviceModel}`);
+                addedCount++;
+            }
+        } catch (error) {
+            addLog(`❌ 环境变量 Session 导入失败: ${error.message}`);
+        } finally {
+            await tempClient.destroy();
+        }
+    }
+    if (addedCount > 0) addLog(`🎉 环境变量导入完成，共新增 ${addedCount} 个账号。`);
+}
+
+module.exports = {
+    runCheckinForAccount,
+    runRenewForAccount,
+    importSessionsFromEnv,
+    runningAccounts
+};
