@@ -56,6 +56,10 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 "--no-first-run",
                 "--no-zygote",
                 "--disable-gpu",
+                "--disable-web-security",
+                "--allow-running-insecure-content",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
                 "--disable-blink-features=AutomationControlled",
                 "--lang=zh-CN,zh",
                 "--window-size=390,844"
@@ -63,6 +67,12 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
         });
 
         const page = await browser.newPage();
+        await page.setBypassCSP(true);
+        try {
+            const cdpSession = await page.target().createCDPSession();
+            await cdpSession.send('Page.setBypassCSP', { enabled: true });
+        } catch (e) {}
+
         await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 3 });
         await page.setUserAgent(deviceConf.userAgent);
 
@@ -265,7 +275,7 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
             const pageSummary = await page.evaluate(() => {
                 const text = document.body ? (document.body.innerText || "").replace(/\s+/g, " ").trim() : "";
                 const ifrCount = document.querySelectorAll("iframe").length;
-                const hasTurnstileInput = Boolean(document.querySelector('input[name="cf-turnstile-response"]'));
+                const hasTurnstileInput = Boolean(document.querySelector('input[name="cf-turnstile-response"]') || document.querySelector('textarea[name="cf-turnstile-response"]'));
                 return { text, ifrCount, hasTurnstileInput };
             }).catch(() => ({ text: "", ifrCount: 0, hasTurnstileInput: false }));
 
@@ -357,12 +367,28 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                                        document.querySelector("label");
                             if (cb) cb.click();
                         }).catch(() => {});
+
+                        if (now - turnstileClickTime > 6000) {
+                            const frameEl = await frame.frameElement();
+                            if (frameEl) {
+                                const box = await frameEl.boundingBox();
+                                if (box && box.width > 0 && box.height > 0) {
+                                    turnstileClickTime = Date.now();
+                                    addLog(`[🤖 ${botName}] 👆 [${maskedPhone}] 模拟点击 Cloudflare 框架...`);
+                                    const clickX = box.x + Math.min(32, Math.max(16, box.width * 0.15));
+                                    const clickY = box.y + box.height / 2;
+                                    await page.mouse.click(clickX, clickY).catch(() => {});
+                                }
+                            }
+                        }
                     }
                 }
             } catch (e) {}
 
             const currentToken = await page.evaluate(() => {
-                const cfInput = document.querySelector('input[name="cf-turnstile-response"]') || document.querySelector('textarea[name="cf-turnstile-response"]');
+                const cfInput = document.querySelector('input[name="cf-turnstile-response"]') || 
+                                document.querySelector('textarea[name="cf-turnstile-response"]') ||
+                                document.querySelector('[name*="turnstile"]');
                 if (cfInput && cfInput.value && cfInput.value.length > 10) return cfInput.value;
                 if (window.turnstile && typeof window.turnstile.getResponse === "function") {
                     try {
