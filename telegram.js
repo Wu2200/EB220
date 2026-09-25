@@ -52,14 +52,9 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-accelerated-2d-canvas",
                 "--no-first-run",
                 "--no-zygote",
                 "--disable-gpu",
-                "--disable-web-security",
-                "--allow-running-insecure-content",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--disable-site-isolation-trials",
                 "--disable-blink-features=AutomationControlled",
                 "--lang=zh-CN,zh",
                 "--window-size=390,844"
@@ -67,28 +62,29 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
         });
 
         const page = await browser.newPage();
-        await page.setBypassCSP(true);
-        try {
-            const cdpSession = await page.target().createCDPSession();
-            await cdpSession.send('Page.setBypassCSP', { enabled: true });
-        } catch (e) {}
-
-        await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 3 });
-        await page.setUserAgent(deviceConf.userAgent);
+        await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
+        
+        const androidUA = "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.127 Mobile Safari/537.36";
+        await page.setUserAgent(androidUA);
 
         let webAppClosed = false;
         let sentWebViewData = null;
 
         page.on("console", (msg) => {
             const txt = msg.text();
-            if (msg.type() === "error" || txt.includes("error") || txt.includes("Error") || txt.includes("Fail") || txt.includes("fail") || txt.includes("turnstile")) {
+            if (txt.includes("cloudflareinsights") || txt.includes("beacon.min.js")) return;
+            if (msg.type() === "error" || txt.includes("error") || txt.includes("Error") || txt.includes("turnstile")) {
                 addLog(`[🤖 ${botName}] 🌐 页面控制台 [${msg.type()}]: ${txt.substring(0, 120)}`);
             }
         });
 
-        page.on("requestfailed", (req) => {
-            const fail = req.failure();
-            addLog(`[🤖 ${botName}] ⚠️ 资源加载失败: ${req.url().substring(0, 80)} (${fail ? fail.errorText : ""})`);
+        page.on("response", (res) => {
+            if (res.status() >= 400) {
+                const url = res.url();
+                if (!url.includes("cloudflareinsights.com") && !url.includes("google-analytics")) {
+                    addLog(`[🤖 ${botName}] ⚠️ 响应 [${res.status()}]: ${url.substring(0, 90)}`);
+                }
+            }
         });
 
         await page.exposeFunction("__tgBridgeEvent", async (eventType, eventData) => {
@@ -127,44 +123,33 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
 
         await page.evaluateOnNewDocument((params, rawInitData, fullHash) => {
             try {
-                if (window.chrome) {
-                    try {
-                        delete window.chrome;
-                    } catch (e) {
-                        window.chrome = undefined;
-                    }
-                }
-
-                try {
-                    delete Navigator.prototype.userAgentData;
-                    delete navigator.userAgentData;
-                    Object.defineProperty(navigator, "userAgentData", { get: () => undefined });
-                } catch (e) {}
-
                 Object.defineProperty(navigator, "webdriver", { get: () => false });
-                Object.defineProperty(navigator, "platform", { get: () => "iPhone" });
-                Object.defineProperty(navigator, "vendor", { get: () => "Apple Computer, Inc." });
+                Object.defineProperty(navigator, "platform", { get: () => "Linux armv81" });
+                Object.defineProperty(navigator, "vendor", { get: () => "Google Inc." });
                 Object.defineProperty(navigator, "maxTouchPoints", { get: () => 5 });
                 Object.defineProperty(navigator, "languages", { get: () => ["zh-CN", "zh", "en-US", "en"] });
                 Object.defineProperty(navigator, "language", { get: () => "zh-CN" });
 
-                if (!navigator.plugins || navigator.plugins.length === 0) {
-                    Object.defineProperty(navigator, "plugins", {
-                        get: () => [1, 2, 3, 4, 5]
-                    });
+                if (!window.chrome) {
+                    window.chrome = {
+                        runtime: {},
+                        loadTimes: function () {},
+                        csi: function () {},
+                        app: {}
+                    };
                 }
 
-                const fakeVendor = (ctx) => {
-                    if (!ctx) return;
-                    const getParam = ctx.prototype.getParameter;
-                    ctx.prototype.getParameter = function (parameter) {
-                        if (parameter === 37445) return "Apple Inc.";
-                        if (parameter === 37446) return "Apple GPU";
-                        return getParam.apply(this, arguments);
-                    };
-                };
-                if (typeof WebGLRenderingContext !== "undefined") fakeVendor(WebGLRenderingContext);
-                if (typeof WebGL2RenderingContext !== "undefined") fakeVendor(WebGL2RenderingContext);
+                if (window.outerWidth === 0) {
+                    Object.defineProperty(window, "outerWidth", { get: () => 390 });
+                    Object.defineProperty(window, "outerHeight", { get: () => 844 });
+                }
+
+                const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+                if (origQuery) {
+                    window.navigator.permissions.query = (p) => (
+                        p.name === "notifications" ? Promise.resolve({ state: "default" }) : origQuery(p)
+                    );
+                }
             } catch (e) {}
 
             try {
@@ -218,7 +203,7 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                     hash: (new URLSearchParams(rawInitData || "")).get("hash") || ""
                 },
                 version: "7.0",
-                platform: "ios",
+                platform: "android",
                 colorScheme: "light",
                 themeParams: {
                     bg_color: "#ffffff",
@@ -776,7 +761,7 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                             webViewResult = await client.invoke(new Api.messages.RequestWebView({
                                 peer: botEntity,
                                 bot: botEntity,
-                                platform: (deviceConf && deviceConf.platform) || "ios",
+                                platform: "android",
                                 fromBotMenu: false,
                                 url: targetButton.url,
                                 msgId: lastBotMsg.id,
@@ -785,7 +770,7 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                         } catch (err1) {
                             webViewResult = await client.invoke(new Api.messages.RequestSimpleWebView({
                                 bot: botEntity,
-                                platform: (deviceConf && deviceConf.platform) || "ios",
+                                platform: "android",
                                 url: targetButton.url,
                                 themeParams: themeParams
                             }));
@@ -919,7 +904,7 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                 const webViewResult = await client.invoke(new Api.messages.RequestWebView({
                     peer: botEntity,
                     bot: botEntity,
-                    platform: deviceConf.platform,
+                    platform: "android",
                     fromBotMenu: false,
                     url: targetWebAppUrl,
                     themeParams: themeParams
