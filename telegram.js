@@ -57,14 +57,13 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 "--no-zygote",
                 "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-web-security",
-                "--allow-running-insecure-content",
+                "--lang=zh-CN,zh",
                 "--window-size=390,844"
             ]
         });
 
         const page = await browser.newPage();
-        await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
+        await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 3 });
         await page.setUserAgent(deviceConf.userAgent);
 
         let webAppClosed = false;
@@ -84,33 +83,65 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
             }
         });
 
-        let hashParamsObj = {};
+        let rawHash = "";
+        let initParamsMap = {};
         try {
             const hashIndex = webViewUrl.indexOf("#");
             if (hashIndex !== -1) {
-                const hashStr = webViewUrl.substring(hashIndex + 1);
-                const sp = new URLSearchParams(hashStr);
-                for (const [k, v] of sp.entries()) {
-                    hashParamsObj[k] = v;
+                rawHash = webViewUrl.substring(hashIndex + 1);
+                const pairs = rawHash.split("&");
+                for (const pair of pairs) {
+                    const eqIdx = pair.indexOf("=");
+                    if (eqIdx !== -1) {
+                        const k = pair.substring(0, eqIdx);
+                        const v = pair.substring(eqIdx + 1);
+                        initParamsMap[k] = v;
+                    }
                 }
             }
         } catch (e) {}
 
-        await page.evaluateOnNewDocument((initParams) => {
-            Object.defineProperty(navigator, "webdriver", { get: () => false });
+        const rawTgWebAppData = initParamsMap["tgWebAppData"] ? decodeURIComponent(initParamsMap["tgWebAppData"]) : "";
 
+        await page.evaluateOnNewDocument((params, rawInitData, fullHash) => {
             try {
-                if (initParams && Object.keys(initParams).length > 0) {
-                    sessionStorage.setItem("__telegram__initParams", JSON.stringify(initParams));
+                Object.defineProperty(navigator, "webdriver", { get: () => false });
+                Object.defineProperty(navigator, "platform", { get: () => "iPhone" });
+                Object.defineProperty(navigator, "vendor", { get: () => "Apple Computer, Inc." });
+                Object.defineProperty(navigator, "maxTouchPoints", { get: () => 5 });
+                Object.defineProperty(navigator, "languages", { get: () => ["zh-CN", "zh", "en-US", "en"] });
+                Object.defineProperty(navigator, "language", { get: () => "zh-CN" });
+
+                if (!navigator.plugins || navigator.plugins.length === 0) {
+                    Object.defineProperty(navigator, "plugins", {
+                        get: () => [1, 2, 3, 4, 5]
+                    });
+                }
+
+                if (typeof WebGLRenderingContext !== "undefined") {
+                    const getParameter = WebGLRenderingContext.prototype.getParameter;
+                    WebGLRenderingContext.prototype.getParameter = function (parameter) {
+                        if (parameter === 37445) return "Apple Inc.";
+                        if (parameter === 37446) return "Apple GPU";
+                        return getParameter.apply(this, arguments);
+                    };
                 }
             } catch (e) {}
 
-            window.TelegramWebviewProxy = {
-                postEvent: function (eventType, eventData) {
-                    if (typeof window.__tgBridgeEvent === "function") {
-                        window.__tgBridgeEvent(eventType, eventData);
-                    }
+            try {
+                if (params && Object.keys(params).length > 0) {
+                    sessionStorage.setItem("__telegram__initParams", JSON.stringify(params));
                 }
+            } catch (e) {}
+
+            const bridgeHandler = function (eventType, eventData) {
+                if (typeof window.__tgBridgeEvent === "function") {
+                    window.__tgBridgeEvent(eventType, eventData);
+                }
+            };
+
+            window.TelegramWebviewProxy = {
+                postEvent: bridgeHandler
             };
 
             window.webkit = {
@@ -122,25 +153,77 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                                 const parsed = typeof data === "string" ? JSON.parse(data) : data;
                                 const evtName = parsed.event_name || parsed.eventType || "";
                                 const evtData = parsed.data || parsed.eventData || "";
-                                if (typeof window.__tgBridgeEvent === "function") {
-                                    window.__tgBridgeEvent(evtName, evtData);
-                                }
+                                bridgeHandler(evtName, evtData);
                             } catch (e) {}
                         }
                     }
                 }
             };
-        }, hashParamsObj);
 
-        await page.goto(webViewUrl, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
+            let parsedUser = null;
+            try {
+                if (rawInitData) {
+                    const sp = new URLSearchParams(rawInitData);
+                    const userStr = sp.get("user");
+                    if (userStr) parsedUser = JSON.parse(userStr);
+                }
+            } catch (e) {}
+
+            window.Telegram = window.Telegram || {};
+            window.Telegram.WebApp = {
+                initData: rawInitData || "",
+                initDataUnsafe: {
+                    query_id: (new URLSearchParams(rawInitData || "")).get("query_id") || "",
+                    user: parsedUser,
+                    auth_date: (new URLSearchParams(rawInitData || "")).get("auth_date") || "",
+                    hash: (new URLSearchParams(rawInitData || "")).get("hash") || ""
+                },
+                version: "7.0",
+                platform: "ios",
+                colorScheme: "light",
+                themeParams: {
+                    bg_color: "#ffffff",
+                    text_color: "#000000",
+                    hint_color: "#707579",
+                    link_color: "#3390ec",
+                    button_color: "#3390ec",
+                    button_text_color: "#ffffff"
+                },
+                isExpanded: true,
+                viewportHeight: 844,
+                viewportStableHeight: 844,
+                headerColor: "#ffffff",
+                backgroundColor: "#ffffff",
+                BackButton: { isVisible: false, onClick: function () {}, offClick: function () {}, show: function () {}, hide: function () {} },
+                MainButton: { text: "CONTINUE", color: "#3390ec", textColor: "#ffffff", isVisible: false, isActive: true, isProgressVisible: false, setText: function () {}, onClick: function () {}, offClick: function () {}, show: function () {}, hide: function () {}, enable: function () {}, disable: function () {}, showProgress: function () {}, hideProgress: function () {} },
+                HapticFeedback: { impactOccurred: function () {}, notificationOccurred: function () {}, selectionChanged: function () {} },
+                ready: function () { bridgeHandler("web_app_ready"); },
+                expand: function () { bridgeHandler("web_app_expand"); },
+                close: function () { bridgeHandler("web_app_close"); },
+                sendData: function (data) { bridgeHandler("web_app_data_send", { data: String(data) }); },
+                openLink: function (url) { bridgeHandler("web_app_open_link", { url: url }); },
+                openTelegramLink: function (url) { bridgeHandler("web_app_open_tg_link", { path_full: url }); }
+            };
+        }, initParamsMap, rawTgWebAppData, rawHash);
+
+        page.on("pageerror", (err) => {
+            const msg = String(err.message || err);
+            if (!msg.includes("Script error") && !msg.includes("ResizeObserver")) {
+                addLog(`[🤖 ${botName}] ⚠️ 页面异常: ${msg.substring(0, 100)}`);
+            }
+        });
+
+        await page.goto(webViewUrl, { waitUntil: "networkidle2", timeout: 30000 }).catch(() => {});
 
         const startWait = Date.now();
-        while (Date.now() - startWait < 30000 && !webAppClosed) {
+        let clickedCaptcha = false;
+
+        while (Date.now() - startWait < 45000 && !webAppClosed) {
             await sleep(2000);
 
             const currentText = await page.evaluate(() => document.body ? (document.body.innerText || "") : "").catch(() => "");
 
-            if (currentText.includes("加载超时") || currentText.includes("重新加载")) {
+            if (currentText.includes("加载超时") || currentText.includes("重新加载") || currentText.includes("网络错误")) {
                 await page.evaluate(() => {
                     const reloadBtns = Array.from(document.querySelectorAll("button, a, div[role='button'], .btn"));
                     for (const b of reloadBtns) {
@@ -157,7 +240,7 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 const frames = page.frames();
                 for (const frame of frames) {
                     const frameUrl = frame.url();
-                    if (frameUrl.includes("challenges.cloudflare.com") || frameUrl.includes("turnstile")) {
+                    if (frameUrl.includes("challenges.cloudflare.com") || frameUrl.includes("turnstile") || frameUrl.includes("cf-chl")) {
                         const clickedInside = await frame.evaluate(() => {
                             const cb = document.querySelector("input[type='checkbox']") ||
                                        document.querySelector("#challenge-stage") ||
@@ -170,13 +253,14 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                             return false;
                         }).catch(() => false);
 
-                        if (!clickedInside) {
-                            const frameEl = await frame.frameElement();
-                            if (frameEl) {
-                                const box = await frameEl.boundingBox();
-                                if (box) {
-                                    await page.mouse.click(box.x + Math.min(30, box.width / 2), box.y + box.height / 2).catch(() => {});
-                                }
+                        const frameEl = await frame.frameElement();
+                        if (frameEl) {
+                            const box = await frameEl.boundingBox();
+                            if (box && box.width > 0 && box.height > 0) {
+                                const clickX = box.x + Math.min(32, box.width / 4);
+                                const clickY = box.y + box.height / 2;
+                                await page.mouse.click(clickX, clickY).catch(() => {});
+                                clickedCaptcha = true;
                             }
                         }
                     }
@@ -185,16 +269,43 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
 
             try {
                 await page.evaluate(() => {
-                    const keywords = ["签到", "簽到", "验证", "驗證", "确认", "確認", "立即签到", "Verify", "Check"];
-                    const buttons = Array.from(document.querySelectorAll("button, a, div[role='button'], .btn"));
-                    for (const btn of buttons) {
-                        const txt = (btn.innerText || btn.textContent || "").trim();
-                        if (txt && keywords.some(k => txt.includes(k))) {
-                            btn.click();
+                    const geetestBtn = document.querySelector(".geetest_radar_tip") ||
+                                       document.querySelector(".geetest_btn") ||
+                                       document.querySelector(".geetest_radar_btn") ||
+                                       document.querySelector(".geetest_holder");
+                    if (geetestBtn) geetestBtn.click();
+                }).catch(() => {});
+            } catch (e) {}
+
+            try {
+                await page.evaluate(() => {
+                    const actionKeywords = ["完成验证", "点击完成验证", "点击验证", "立即签到", "确认", "确定", "Submit", "Verify"];
+                    const elements = Array.from(document.querySelectorAll("button, a, div[role='button'], input[type='submit'], .btn"));
+                    for (const el of elements) {
+                        const txt = (el.innerText || el.textContent || el.value || "").trim();
+                        if (txt && actionKeywords.some(k => txt.includes(k))) {
+                            el.click();
                         }
                     }
                 }).catch(() => {});
             } catch (e) {}
+
+            const hasTurnstileToken = await page.evaluate(() => {
+                const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+                return Boolean(cfInput && cfInput.value && cfInput.value.length > 10);
+            }).catch(() => false);
+
+            if (hasTurnstileToken) {
+                addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] 已成功获取 Cloudflare 验证 Token`);
+                await page.evaluate(() => {
+                    const submitBtn = Array.from(document.querySelectorAll("button, a, div[role='button'], input[type='submit'], .btn"))
+                        .find(b => {
+                            const t = (b.innerText || b.textContent || b.value || "").trim();
+                            return t.includes("验证") || t.includes("提交") || t.includes("签到") || t.includes("Submit");
+                        });
+                    if (submitBtn) submitBtn.click();
+                }).catch(() => {});
+            }
 
             if (currentText.includes("验证成功") || currentText.includes("签到成功") || currentText.includes("Verification successful") || currentText.includes("Success")) {
                 addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] 小程序页面已检测到验证成功标识`);
