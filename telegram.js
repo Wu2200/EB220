@@ -72,38 +72,40 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
         let webAppClosed = false;
         let sentWebViewData = null;
         let lastChallenge = "";
+        let lastSiteKey = "";
 
         page.on("console", (msg) => {
             const txt = msg.text();
             if (txt.includes("cloudflareinsights") || txt.includes("beacon.min.js")) return;
-            if (msg.type() === "error" || txt.includes("error") || txt.includes("Error") || txt.includes("turnstile")) {
+            if (msg.type() === "error" || txt.includes("error") || txt.includes("Error") || txt.includes("turnstile") || txt.includes("Turnstile")) {
                 addLog(`[🤖 ${botName}] 🌐 页面控制台 [${msg.type()}]: ${txt.substring(0, 120)}`);
             }
         });
 
         page.on("request", (req) => {
             const url = req.url();
-            if (url.includes("/checkin") || url.includes("/telegram/")) {
+            if (url.includes("/checkin") || url.includes("/telegram/") || url.includes("challenges.cloudflare.com")) {
                 const pd = req.postData();
-                addLog(`[🤖 ${botName}] 📤 请求 [${req.method()}]: ${url.substring(0, 70)} (负载: ${pd ? pd.substring(0, 80) : "无"})`);
+                addLog(`[🤖 ${botName}] 📤 请求 [${req.method()}]: ${url.substring(0, 65)} ${pd ? `(负载: ${pd.substring(0, 60)})` : ""}`);
             }
         });
 
         page.on("response", async (res) => {
             const url = res.url();
-            if (url.includes("/checkin") || res.status() >= 400) {
+            if (url.includes("/checkin") || url.includes("challenges.cloudflare.com") || res.status() >= 400) {
                 if (url.includes("cloudflareinsights.com") || url.includes("google-analytics")) return;
                 let body = "";
                 try {
                     body = await res.text();
                     try {
                         const parsed = JSON.parse(body);
-                        if (parsed && parsed.data && parsed.data.challenge) {
-                            lastChallenge = parsed.data.challenge;
+                        if (parsed && parsed.data) {
+                            if (parsed.data.challenge) lastChallenge = parsed.data.challenge;
+                            if (parsed.data.site_key) lastSiteKey = parsed.data.site_key;
                         }
                     } catch (e) {}
                 } catch (e) {}
-                addLog(`[🤖 ${botName}] 📥 响应 [${res.status()}]: ${url.substring(0, 70)} -> ${body ? body.substring(0, 120) : "无响应体"}`);
+                addLog(`[🤖 ${botName}] 📥 响应 [${res.status()}]: ${url.substring(0, 65)} -> ${body ? body.substring(0, 100) : "无响应体"}`);
             }
         });
 
@@ -143,6 +145,9 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
 
         await page.evaluateOnNewDocument((params, rawInitData, fullHash) => {
             try {
+                try {
+                    delete Object.getPrototypeOf(navigator).webdriver;
+                } catch (e) {}
                 Object.defineProperty(navigator, "webdriver", { get: () => undefined });
                 Object.defineProperty(navigator, "platform", { get: () => "Linux armv81" });
                 Object.defineProperty(navigator, "vendor", { get: () => "Google Inc." });
@@ -272,19 +277,10 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
         let turnstileClickTime = 0;
         let submittedToken = false;
         let lastLoggedSummary = "";
+        let clickedTab = false;
 
         while (Date.now() - startWait < 50000 && !webAppClosed) {
             await sleep(1500);
-
-            await page.evaluate(() => {
-                window.scrollTo(0, document.body.scrollHeight);
-                const candidates = document.querySelectorAll('iframe, .cf-turnstile, [data-sitekey], [id*="cf-"], [id*="turnstile"]');
-                candidates.forEach(el => {
-                    try {
-                        el.scrollIntoView({ block: 'center' });
-                    } catch (e) {}
-                });
-            }).catch(() => {});
 
             const pageSummary = await page.evaluate(() => {
                 const text = document.body ? (document.body.innerText || "").replace(/\s+/g, " ").trim() : "";
@@ -294,14 +290,35 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                     h: f.offsetHeight
                 }));
                 const hasTurnstileInput = Boolean(document.querySelector('input[name="cf-turnstile-response"]') || document.querySelector('textarea[name="cf-turnstile-response"]'));
-                return { text, ifrList, hasTurnstileInput };
-            }).catch(() => ({ text: "", ifrList: [], hasTurnstileInput: false }));
+                const hasTurnstileObj = Boolean(window.turnstile);
+                return { text, ifrList, hasTurnstileInput, hasTurnstileObj };
+            }).catch(() => ({ text: "", ifrList: [], hasTurnstileInput: false, hasTurnstileObj: false }));
 
             const currentText = pageSummary.text;
 
             if (currentText && currentText !== lastLoggedSummary && !currentText.includes(lastLoggedSummary)) {
                 lastLoggedSummary = currentText.substring(0, 60);
                 addLog(`[🤖 ${botName}] 📄 [${maskedPhone}] 页面内容: ${lastLoggedSummary}...`);
+            }
+
+            if (!clickedTab && currentText.includes("人机验证")) {
+                const clickRes = await page.evaluate(() => {
+                    const allEls = Array.from(document.querySelectorAll("button, a, div[role='button'], .card, div, span, p"));
+                    for (const el of allEls) {
+                        const txt = (el.innerText || el.textContent || "").trim();
+                        if (txt === "人机验证" || txt === "点击验证" || txt === "开始验证") {
+                            el.click();
+                            return txt;
+                        }
+                    }
+                    return null;
+                }).catch(() => null);
+
+                if (clickRes) {
+                    clickedTab = true;
+                    addLog(`[🤖 ${botName}] 👉 [${maskedPhone}] 激活验证选项: [${clickRes}]`);
+                    await sleep(2000);
+                }
             }
 
             if (currentText.includes("加载超时") || currentText.includes("重新加载") || currentText.includes("网络错误")) {
