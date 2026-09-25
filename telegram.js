@@ -1184,6 +1184,8 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
     addLog(`📱 [${maskedPhone}] 开始执行任务，当前设备环境: ${deviceConf.deviceModel}`);
     const client = new TelegramClient(new StringSession(account.session), apiId, data.settings.apiHash, deviceConf);
     
+    let hasCheckinSuccessOverall = false;
+
     try {
         await client.connect();
         try {
@@ -1325,6 +1327,7 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                     addLog(`[🤖 ${displayName}] ❌ 签到失败，已安排重试。`);
                 }
             } else {
+                hasCheckinSuccessOverall = true;
                 state.lastSuccessTime = Date.now();
                 if (!skipCheckinSteps) {
                     addLog(`[🤖 ${displayName}] ✅ 签到确认成功！`);
@@ -1391,13 +1394,26 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
             addLog(`[🤖 ${displayName}] 📅 [${maskedPhone}] 下次执行时间已设定为: ${nextTimeStr}`);
         }
 
-        await simulateBrowseChannelOrIdle(client, maskedPhone, 300000);
+        if (!isManual && hasCheckinSuccessOverall) {
+            await simulateBrowseChannelOrIdle(client, maskedPhone, 300000);
+        }
 
     } catch (error) {
-        addLog(`❌ [${maskedPhone}] 运行出错: ${error.message}`);
         const errStr = String(error.message || error);
+        addLog(`❌ [${maskedPhone}] 运行出错: ${errStr}`);
         data = loadData();
-        if (errStr.includes("AUTH_KEY_UNREGISTERED") || errStr.includes("USER_DEACTIVATED") || errStr.includes("SESSION_REVOKED") || errStr.includes("PHONE_NUMBER_BANNED")) {
+
+        if (errStr.includes("AUTH_KEY_DUPLICATED")) {
+            addLog(`⚠️ [${maskedPhone}] 检测到该账号 Session 在其他地方或旧进程中仍处于连接状态，已安排 1 分钟后重新尝试。`);
+            const retryTime = Date.now() + 60 * 1000;
+            data.bots.forEach(b => {
+                if (b.states && b.states[accountPhone]) {
+                    b.states[accountPhone].nextRunTime = retryTime;
+                    b.states[accountPhone].lastStatus = 'fail';
+                }
+            });
+            saveData(data);
+        } else if (errStr.includes("AUTH_KEY_UNREGISTERED") || errStr.includes("USER_DEACTIVATED") || errStr.includes("SESSION_REVOKED") || errStr.includes("PHONE_NUMBER_BANNED")) {
             addLog(`🚨 [${maskedPhone}] 检测到账号已被封禁或 Session 已失效，已自动推迟该账号所有任务 24 小时。`);
             const longNextTime = Date.now() + 24 * 60 * 60 * 1000;
             data.bots.forEach(b => {
@@ -1418,6 +1434,9 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
             saveData(data);
         }
     } finally {
+        try {
+            await client.disconnect();
+        } catch (e) {}
         try {
             await client.destroy();
         } catch (e) {}
@@ -1497,6 +1516,9 @@ async function runRenewForAccount(accountPhone, targetBotUsername) {
         addLog(`[🤖 ${botObj.name}] ❌ [${maskedPhone}] 续费测试失败: ${err.message}`);
     } finally {
         try {
+            await client.disconnect();
+        } catch (e) {}
+        try {
             await client.destroy();
         } catch (e) {}
         runningAccounts.delete(accountPhone);
@@ -1541,7 +1563,12 @@ async function importSessionsFromEnv() {
         } catch (error) {
             addLog(`❌ 环境变量 Session 导入失败: ${error.message}`);
         } finally {
-            await tempClient.destroy();
+            try {
+                await tempClient.disconnect();
+            } catch (e) {}
+            try {
+                await tempClient.destroy();
+            } catch (e) {}
         }
     }
     if (addedCount > 0) addLog(`🎉 环境变量导入完成，共新增 ${addedCount} 个账号。`);
