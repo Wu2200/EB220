@@ -57,6 +57,7 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 "--no-zygote",
                 "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
                 "--lang=zh-CN,zh",
                 "--window-size=390,844"
             ]
@@ -105,6 +106,14 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
 
         await page.evaluateOnNewDocument((params, rawInitData, fullHash) => {
             try {
+                if (window.chrome) {
+                    try {
+                        delete window.chrome;
+                    } catch (e) {
+                        window.chrome = undefined;
+                    }
+                }
+
                 Object.defineProperty(navigator, "webdriver", { get: () => false });
                 Object.defineProperty(navigator, "platform", { get: () => "iPhone" });
                 Object.defineProperty(navigator, "vendor", { get: () => "Apple Computer, Inc." });
@@ -118,14 +127,17 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                     });
                 }
 
-                if (typeof WebGLRenderingContext !== "undefined") {
-                    const getParameter = WebGLRenderingContext.prototype.getParameter;
-                    WebGLRenderingContext.prototype.getParameter = function (parameter) {
+                const fakeVendor = (ctx) => {
+                    if (!ctx) return;
+                    const getParam = ctx.prototype.getParameter;
+                    ctx.prototype.getParameter = function (parameter) {
                         if (parameter === 37445) return "Apple Inc.";
                         if (parameter === 37446) return "Apple GPU";
-                        return getParameter.apply(this, arguments);
+                        return getParam.apply(this, arguments);
                     };
-                }
+                };
+                if (typeof WebGLRenderingContext !== "undefined") fakeVendor(WebGLRenderingContext);
+                if (typeof WebGL2RenderingContext !== "undefined") fakeVendor(WebGL2RenderingContext);
             } catch (e) {}
 
             try {
@@ -216,10 +228,11 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
         await page.goto(webViewUrl, { waitUntil: "networkidle2", timeout: 30000 }).catch(() => {});
 
         const startWait = Date.now();
-        let clickedCaptcha = false;
+        let reportedTurnstile = false;
+        let lastReportedText = "";
 
         while (Date.now() - startWait < 45000 && !webAppClosed) {
-            await sleep(2000);
+            await sleep(1500);
 
             const currentText = await page.evaluate(() => document.body ? (document.body.innerText || "") : "").catch(() => "");
 
@@ -236,33 +249,60 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 }).catch(() => {});
             }
 
+            const clickedBtn = await page.evaluate(() => {
+                const keywords = ["人机验证", "开始验证", "点击验证", "立即验证", "进行验证", "完成验证", "点击完成验证", "立即签到", "确认", "确定", "Submit", "Verify"];
+                const elements = Array.from(document.querySelectorAll("button, a, div[role='button'], input[type='submit'], .btn, .card, div, span"));
+                for (const el of elements) {
+                    const txt = (el.innerText || el.textContent || el.value || "").trim();
+                    if (txt && keywords.some(k => txt === k || (txt.length < 15 && txt.includes(k)))) {
+                        if (el.children.length <= 1 || el.tagName === "BUTTON" || el.tagName === "A" || el.getAttribute("role") === "button") {
+                            el.click();
+                            return txt;
+                        }
+                    }
+                }
+                return null;
+            }).catch(() => null);
+
+            if (clickedBtn && clickedBtn !== lastReportedText) {
+                lastReportedText = clickedBtn;
+                addLog(`[🤖 ${botName}] 👉 [${maskedPhone}] 点击了操作按钮: [${clickedBtn}]`);
+            }
+
+            try {
+                const iframes = await page.$$("iframe");
+                for (const ifr of iframes) {
+                    const box = await ifr.boundingBox();
+                    if (box && box.width > 20 && box.height > 20) {
+                        const src = await ifr.evaluate(el => el.src || '').catch(() => '');
+                        const isCf = src.includes("challenges.cloudflare.com") || src.includes("turnstile") || src.includes("cf-chl") || src === "" || src.includes("about:blank");
+                        if (isCf) {
+                            const clickX = box.x + Math.min(32, Math.max(16, box.width * 0.15));
+                            const clickY = box.y + box.height / 2;
+                            await page.mouse.move(box.x + 5, box.y + 5);
+                            await sleep(50);
+                            await page.mouse.move(clickX, clickY, { steps: 3 });
+                            await sleep(50);
+                            await page.mouse.down();
+                            await sleep(80);
+                            await page.mouse.up();
+                        }
+                    }
+                }
+            } catch (e) {}
+
             try {
                 const frames = page.frames();
                 for (const frame of frames) {
                     const frameUrl = frame.url();
                     if (frameUrl.includes("challenges.cloudflare.com") || frameUrl.includes("turnstile") || frameUrl.includes("cf-chl")) {
-                        const clickedInside = await frame.evaluate(() => {
+                        await frame.evaluate(() => {
                             const cb = document.querySelector("input[type='checkbox']") ||
                                        document.querySelector("#challenge-stage") ||
                                        document.querySelector(".ctp-checkbox-label") ||
                                        document.querySelector("label");
-                            if (cb) {
-                                cb.click();
-                                return true;
-                            }
-                            return false;
-                        }).catch(() => false);
-
-                        const frameEl = await frame.frameElement();
-                        if (frameEl) {
-                            const box = await frameEl.boundingBox();
-                            if (box && box.width > 0 && box.height > 0) {
-                                const clickX = box.x + Math.min(32, box.width / 4);
-                                const clickY = box.y + box.height / 2;
-                                await page.mouse.click(clickX, clickY).catch(() => {});
-                                clickedCaptcha = true;
-                            }
-                        }
+                            if (cb) cb.click();
+                        }).catch(() => {});
                     }
                 }
             } catch (e) {}
@@ -277,33 +317,27 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 }).catch(() => {});
             } catch (e) {}
 
-            try {
+            const turnstileToken = await page.evaluate(() => {
+                const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
+                if (cfInput && cfInput.value && cfInput.value.length > 10) return cfInput.value;
+                if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
+                    const t = window.turnstile.getResponse();
+                    if (t && t.length > 10) return t;
+                }
+                return null;
+            }).catch(() => null);
+
+            if (turnstileToken && !reportedTurnstile) {
+                reportedTurnstile = true;
+                addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] 已成功获取 Cloudflare 验证 Token！`);
                 await page.evaluate(() => {
-                    const actionKeywords = ["完成验证", "点击完成验证", "点击验证", "立即签到", "确认", "确定", "Submit", "Verify"];
-                    const elements = Array.from(document.querySelectorAll("button, a, div[role='button'], input[type='submit'], .btn"));
-                    for (const el of elements) {
-                        const txt = (el.innerText || el.textContent || el.value || "").trim();
-                        if (txt && actionKeywords.some(k => txt.includes(k))) {
-                            el.click();
+                    const submits = Array.from(document.querySelectorAll("button, a, div[role='button'], input[type='submit'], .btn"));
+                    for (const b of submits) {
+                        const t = (b.innerText || b.textContent || b.value || "").trim();
+                        if (t.includes("验证") || t.includes("提交") || t.includes("签到") || t.includes("确定") || t.includes("Submit")) {
+                            b.click();
                         }
                     }
-                }).catch(() => {});
-            } catch (e) {}
-
-            const hasTurnstileToken = await page.evaluate(() => {
-                const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-                return Boolean(cfInput && cfInput.value && cfInput.value.length > 10);
-            }).catch(() => false);
-
-            if (hasTurnstileToken) {
-                addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] 已成功获取 Cloudflare 验证 Token`);
-                await page.evaluate(() => {
-                    const submitBtn = Array.from(document.querySelectorAll("button, a, div[role='button'], input[type='submit'], .btn"))
-                        .find(b => {
-                            const t = (b.innerText || b.textContent || b.value || "").trim();
-                            return t.includes("验证") || t.includes("提交") || t.includes("签到") || t.includes("Submit");
-                        });
-                    if (submitBtn) submitBtn.click();
                 }).catch(() => {});
             }
 
@@ -1295,7 +1329,7 @@ async function runRenewForAccount(accountPhone, targetBotUsername) {
         const botEntity = await client.getEntity(botObj.username);
         const renewResult = await executeStepList(client, botEntity, botObj.renewSteps, maskedPhone, botObj.name, botObj.checkKeywords, deviceConf, "续费测试");
         
-        const todayBj = getBjDateString();
+        const todayBjDate = getBjDateString();
         data = loadData();
         let bIdx = data.bots.findIndex(b => b.username === botObj.username);
         if (bIdx !== -1) {
@@ -1312,9 +1346,9 @@ async function runRenewForAccount(accountPhone, targetBotUsername) {
                 };
             }
             if (renewResult.isSuccess) {
-                data.bots[bIdx].states[accountPhone].lastRenewDate = todayBj;
+                data.bots[bIdx].states[accountPhone].lastRenewDate = todayBjDate;
                 data.bots[bIdx].states[accountPhone].lastRenewStatus = 'success';
-                addLog(`[🤖 ${botObj.name}] 🌟 [${maskedPhone}] 续费测试执行成功，已更新续费日期为: ${todayBj}`);
+                addLog(`[🤖 ${botObj.name}] 🌟 [${maskedPhone}] 续费测试执行成功，已更新续费日期为: ${todayBjDate}`);
             } else {
                 data.bots[bIdx].states[accountPhone].lastRenewStatus = 'fail';
                 addLog(`[🤖 ${botObj.name}] ⚠️ [${maskedPhone}] 续费测试未匹配检测关键词或未确认成功`);
