@@ -830,10 +830,10 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
             }
 
             const lastSuccessBj = state.lastSuccessTime ? getBjDateString(state.lastSuccessTime) : "";
-            let isCheckinSuccess = (todayBj === lastSuccessBj);
+            let isCheckinSuccess = !isManual && (todayBj === lastSuccessBj);
             let skipCheckinSteps = isCheckinSuccess;
 
-            if (!skipCheckinSteps && state.todayRetryCount > 0 && botObj.checkKeywords && botObj.checkKeywords.trim() !== "") {
+            if (!isManual && !skipCheckinSteps && state.todayRetryCount > 0 && botObj.checkKeywords && botObj.checkKeywords.trim() !== "") {
                 try {
                     let preCheckMessages = await client.getMessages(botEntity, { limit: 5 });
                     let lastOutMsg = preCheckMessages.find(m => m.out);
@@ -866,7 +866,7 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                 }
             }
 
-            if (state.todayRetryCount >= 2) {
+            if (!isManual && state.todayRetryCount >= 2) {
                 addLog(`[🤖 ${displayName}] ⚠️ 今日已达到重试上限(2次)，推迟至明日再次尝试。`);
                 state.nextRunTime = getNextRandomTime(1);
                 data = loadData();
@@ -880,10 +880,12 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                 continue;
             }
 
-            state.todayRetryCount = (state.todayRetryCount || 0) + 1;
+            if (!isManual) {
+                state.todayRetryCount = (state.todayRetryCount || 0) + 1;
+            }
 
             if (!skipCheckinSteps) {
-                if (state.todayRetryCount === 1) {
+                if (state.todayRetryCount <= 1 || isManual) {
                     addLog(`[🤖 ${displayName}] 🚀 开始执行签到...`);
                 } else {
                     addLog(`[🤖 ${displayName}] 🚀 开始执行签到 重试...`);
@@ -897,7 +899,9 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
 
             if (!isCheckinSuccess) {
                 state.lastStatus = 'fail';
-                if (state.todayRetryCount >= 2) {
+                if (isManual) {
+                    addLog(`[🤖 ${displayName}] ❌ 手动签到测试失败。`);
+                } else if (state.todayRetryCount >= 2) {
                     state.retryCount = 0;
                     state.nextRunTime = getNextRandomTime(checkinInterval);
                     addLog(`[🤖 ${displayName}] ❌ 今日签到重试已失败，推迟至下次周期。`);
@@ -912,7 +916,11 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                 }
             } else {
                 state.lastSuccessTime = Date.now();
-                addLog(`[🤖 ${displayName}] ✅ 签到确认成功！`);
+                if (!skipCheckinSteps) {
+                    addLog(`[🤖 ${displayName}] ✅ 签到确认成功！`);
+                } else {
+                    addLog(`[🤖 ${displayName}] ℹ️ 今日已签到成功，跳过签到步骤。`);
+                }
 
                 const renewInterval = parseInt(botObj.renewIntervalDays) || 0;
                 const hasRenewConfig = renewInterval > 0 && Array.isArray(botObj.renewSteps) && botObj.renewSteps.length > 0;
@@ -944,7 +952,8 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                         state.lastStatus = 'fail';
                         state.lastRenewStatus = 'fail';
                         addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 自动续费失败，准备安排重试...`);
-                        if (state.todayRetryCount >= 2) {
+                        if (isManual) {
+                        } else if (state.todayRetryCount >= 2) {
                             state.retryCount = 0;
                             state.nextRunTime = getNextRandomTime(1);
                             addLog(`[🤖 ${displayName}] ⚠️ 今日续费重试已达上限，推迟至明天再次尝试。`);
