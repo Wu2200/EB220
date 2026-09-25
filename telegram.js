@@ -56,10 +56,6 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 "--no-first-run",
                 "--no-zygote",
                 "--disable-gpu",
-                "--disable-web-security",
-                "--allow-running-insecure-content",
-                "--disable-features=IsolateOrigins,site-per-process",
-                "--disable-site-isolation-trials",
                 "--disable-blink-features=AutomationControlled",
                 "--lang=zh-CN,zh",
                 "--window-size=390,844"
@@ -68,47 +64,6 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
 
         const page = await browser.newPage();
         await page.setBypassCSP(true);
-
-        try {
-            const cdp = await page.target().createCDPSession();
-            await cdp.send("Page.setBypassCSP", { enabled: true });
-            await cdp.send("Fetch.enable", {
-                patterns: [
-                    { requestStage: "Response", resourceType: "Document" }
-                ]
-            });
-
-            cdp.on("Fetch.requestPaused", async (event) => {
-                const { requestId, responseHeaders, responseStatusCode } = event;
-                if (responseStatusCode >= 300 && responseStatusCode < 400) {
-                    await cdp.send("Fetch.continueRequest", { requestId }).catch(() => {});
-                    return;
-                }
-                try {
-                    const res = await cdp.send("Fetch.getResponseBody", { requestId });
-                    let body = res.base64Encoded ? Buffer.from(res.body, "base64").toString("utf-8") : res.body;
-
-                    body = body.replace(/<meta[\s\S]*?content-security-policy[\s\S]*?>/gi, "");
-
-                    const cleanHeaders = (responseHeaders || []).filter(h => {
-                        const name = h.name.toLowerCase();
-                        return !name.includes("content-security-policy") &&
-                               name !== "content-encoding" &&
-                               name !== "content-length";
-                    });
-
-                    await cdp.send("Fetch.fulfillRequest", {
-                        requestId,
-                        responseCode: responseStatusCode || 200,
-                        responseHeaders: cleanHeaders,
-                        body: Buffer.from(body).toString("base64")
-                    });
-                } catch (err) {
-                    await cdp.send("Fetch.continueRequest", { requestId }).catch(() => {});
-                }
-            });
-        } catch (e) {}
-
         await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
         
         const androidUA = "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.127 Mobile Safari/537.36";
@@ -125,12 +80,23 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
             }
         });
 
-        page.on("response", (res) => {
-            if (res.status() >= 400) {
-                const url = res.url();
-                if (!url.includes("cloudflareinsights.com") && !url.includes("google-analytics")) {
-                    addLog(`[🤖 ${botName}] ⚠️ 响应 [${res.status()}]: ${url.substring(0, 90)}`);
-                }
+        page.on("request", (req) => {
+            const url = req.url();
+            if (url.includes("/checkin") || url.includes("/telegram/")) {
+                const pd = req.postData();
+                addLog(`[🤖 ${botName}] 📤 请求 [${req.method()}]: ${url.substring(0, 70)} (负载: ${pd ? pd.substring(0, 80) : "无"})`);
+            }
+        });
+
+        page.on("response", async (res) => {
+            const url = res.url();
+            if (url.includes("/checkin") || res.status() >= 400) {
+                if (url.includes("cloudflareinsights.com") || url.includes("google-analytics")) return;
+                let body = "";
+                try {
+                    body = await res.text();
+                } catch (e) {}
+                addLog(`[🤖 ${botName}] 📥 响应 [${res.status()}]: ${url.substring(0, 70)} -> ${body ? body.substring(0, 120) : "无响应体"}`);
             }
         });
 
@@ -170,7 +136,7 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
 
         await page.evaluateOnNewDocument((params, rawInitData, fullHash) => {
             try {
-                Object.defineProperty(navigator, "webdriver", { get: () => false });
+                Object.defineProperty(navigator, "webdriver", { get: () => undefined });
                 Object.defineProperty(navigator, "platform", { get: () => "Linux armv81" });
                 Object.defineProperty(navigator, "vendor", { get: () => "Google Inc." });
                 Object.defineProperty(navigator, "maxTouchPoints", { get: () => 5 });
@@ -296,7 +262,7 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
         } catch (e) {}
 
         const startWait = Date.now();
-        const clickedKeywords = new Set();
+        let clickedCaptchaTab = false;
         let turnstileClickTime = 0;
         let submittedToken = false;
         let lastLoggedSummary = "";
@@ -331,33 +297,23 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 }).catch(() => {});
             }
 
-            const candidateKeywords = [
-                "人机验证", "开始验证", "点击验证", "立即验证", "进行验证",
-                "完成验证", "点击完成验证", "确认", "确定"
-            ];
-
-            for (const kw of candidateKeywords) {
-                if (clickedKeywords.has(kw)) continue;
-
-                const clickedThis = await page.evaluate((targetKw) => {
-                    const allEls = Array.from(document.querySelectorAll("button, a, div[role='button'], input[type='submit'], .btn, .card, div, span"));
+            if (!clickedCaptchaTab && currentText.includes("人机验证")) {
+                const clickedTab = await page.evaluate(() => {
+                    const allEls = Array.from(document.querySelectorAll("button, a, div[role='button'], .card, div, span"));
                     for (const el of allEls) {
-                        const txt = (el.innerText || el.textContent || el.value || "").trim();
-                        if (txt === targetKw || (txt.length <= 12 && txt.includes(targetKw))) {
-                            if (el.tagName === "BUTTON" || el.tagName === "A" || el.getAttribute("role") === "button" || el.classList.contains("btn") || el.classList.contains("card") || el.children.length === 0) {
-                                el.click();
-                                return txt;
-                            }
+                        const txt = (el.innerText || el.textContent || "").trim();
+                        if (txt === "人机验证" || txt === "点击验证") {
+                            el.click();
+                            return txt;
                         }
                     }
                     return null;
-                }, kw).catch(() => null);
+                }).catch(() => null);
 
-                if (clickedThis) {
-                    clickedKeywords.add(kw);
-                    addLog(`[🤖 ${botName}] 👉 [${maskedPhone}] 点击了操作项: [${clickedThis}]`);
-                    await sleep(2000);
-                    break;
+                if (clickedTab) {
+                    clickedCaptchaTab = true;
+                    addLog(`[🤖 ${botName}] 👉 [${maskedPhone}] 激活验证选项: [${clickedTab}]`);
+                    await sleep(2500);
                 }
             }
 
@@ -369,15 +325,15 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                     if (box && box.width > 20 && box.height > 20) {
                         const src = await ifr.evaluate(el => el.src || "").catch(() => "");
                         const isCf = src.includes("challenges.cloudflare.com") || src.includes("turnstile") || src.includes("cf-chl") || src === "" || src.includes("about:blank");
-                        if (isCf && now - turnstileClickTime > 6000) {
+                        if (isCf && now - turnstileClickTime > 7000) {
                             turnstileClickTime = Date.now();
-                            addLog(`[🤖 ${botName}] 👆 [${maskedPhone}] 检测到 Cloudflare 验证框，正在模拟点击复选框...`);
+                            addLog(`[🤖 ${botName}] 👆 [${maskedPhone}] 捕获到 Cloudflare 交互框架，模拟点击复选框...`);
                             const clickX = box.x + Math.min(32, Math.max(16, box.width * 0.15));
                             const clickY = box.y + box.height / 2;
                             await page.mouse.move(box.x + 2, box.y + 2);
-                            await sleep(50);
+                            await sleep(60);
                             await page.mouse.move(clickX, clickY, { steps: 5 });
-                            await sleep(50);
+                            await sleep(60);
                             await page.mouse.down();
                             await sleep(90);
                             await page.mouse.up();
@@ -399,20 +355,6 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                                        document.querySelector("label");
                             if (cb) cb.click();
                         }).catch(() => {});
-
-                        if (now - turnstileClickTime > 6000) {
-                            const frameEl = await frame.frameElement();
-                            if (frameEl) {
-                                const box = await frameEl.boundingBox();
-                                if (box && box.width > 0 && box.height > 0) {
-                                    turnstileClickTime = Date.now();
-                                    addLog(`[🤖 ${botName}] 👆 [${maskedPhone}] 模拟点击 Cloudflare 框架...`);
-                                    const clickX = box.x + Math.min(32, Math.max(16, box.width * 0.15));
-                                    const clickY = box.y + box.height / 2;
-                                    await page.mouse.click(clickX, clickY).catch(() => {});
-                                }
-                            }
-                        }
                     }
                 }
             } catch (e) {}
@@ -433,7 +375,8 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
 
             if (currentToken && !submittedToken) {
                 submittedToken = true;
-                addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] 已成功获取 Cloudflare 验证 Token: ${currentToken.substring(0, 16)}...`);
+                addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] 成功获取 Cloudflare 验证 Token: ${currentToken.substring(0, 16)}...`);
+                await sleep(1000);
                 await page.evaluate((tok) => {
                     const submits = Array.from(document.querySelectorAll("button, a, div[role='button'], input[type='submit'], .btn"));
                     for (const b of submits) {
