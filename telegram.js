@@ -56,7 +56,10 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 "--no-first-run",
                 "--no-zygote",
                 "--disable-gpu",
-                "--disable-blink-features=AutomationControlled"
+                "--disable-blink-features=AutomationControlled",
+                "--disable-web-security",
+                "--allow-running-insecure-content",
+                "--window-size=390,844"
             ]
         });
 
@@ -81,8 +84,27 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
             }
         });
 
-        await page.evaluateOnNewDocument(() => {
+        let hashParamsObj = {};
+        try {
+            const hashIndex = webViewUrl.indexOf("#");
+            if (hashIndex !== -1) {
+                const hashStr = webViewUrl.substring(hashIndex + 1);
+                const sp = new URLSearchParams(hashStr);
+                for (const [k, v] of sp.entries()) {
+                    hashParamsObj[k] = v;
+                }
+            }
+        } catch (e) {}
+
+        await page.evaluateOnNewDocument((initParams) => {
             Object.defineProperty(navigator, "webdriver", { get: () => false });
+
+            try {
+                if (initParams && Object.keys(initParams).length > 0) {
+                    sessionStorage.setItem("__telegram__initParams", JSON.stringify(initParams));
+                }
+            } catch (e) {}
+
             window.TelegramWebviewProxy = {
                 postEvent: function (eventType, eventData) {
                     if (typeof window.__tgBridgeEvent === "function") {
@@ -90,31 +112,78 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                     }
                 }
             };
-        });
 
-        await page.goto(webViewUrl, { waitUntil: "domcontentloaded", timeout: 25000 }).catch(() => {});
+            window.webkit = {
+                messageHandlers: {
+                    performAction: {
+                        postMessage: function (data) {
+                            if (!data) return;
+                            try {
+                                const parsed = typeof data === "string" ? JSON.parse(data) : data;
+                                const evtName = parsed.event_name || parsed.eventType || "";
+                                const evtData = parsed.data || parsed.eventData || "";
+                                if (typeof window.__tgBridgeEvent === "function") {
+                                    window.__tgBridgeEvent(evtName, evtData);
+                                }
+                            } catch (e) {}
+                        }
+                    }
+                }
+            };
+        }, hashParamsObj);
+
+        await page.goto(webViewUrl, { waitUntil: "domcontentloaded", timeout: 30000 }).catch(() => {});
 
         const startWait = Date.now();
-        while (Date.now() - startWait < 18000 && !webAppClosed) {
+        while (Date.now() - startWait < 30000 && !webAppClosed) {
             await sleep(2000);
+
+            const currentText = await page.evaluate(() => document.body ? (document.body.innerText || "") : "").catch(() => "");
+
+            if (currentText.includes("加载超时") || currentText.includes("重新加载")) {
+                await page.evaluate(() => {
+                    const reloadBtns = Array.from(document.querySelectorAll("button, a, div[role='button'], .btn"));
+                    for (const b of reloadBtns) {
+                        const txt = (b.innerText || b.textContent || "").trim();
+                        if (txt.includes("重新加载") || txt.includes("Reload") || txt.includes("重试")) {
+                            b.click();
+                            break;
+                        }
+                    }
+                }).catch(() => {});
+            }
 
             try {
                 const frames = page.frames();
                 for (const frame of frames) {
                     const frameUrl = frame.url();
                     if (frameUrl.includes("challenges.cloudflare.com") || frameUrl.includes("turnstile")) {
-                        const box = await frame.evaluate(() => {
-                            const el = document.querySelector("input[type='checkbox']") || document.body;
-                            if (!el) return null;
-                            const rect = el.getBoundingClientRect();
-                            return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
-                        }).catch(() => null);
-                        if (box) {
-                            await frame.click("body").catch(() => {});
+                        const clickedInside = await frame.evaluate(() => {
+                            const cb = document.querySelector("input[type='checkbox']") ||
+                                       document.querySelector("#challenge-stage") ||
+                                       document.querySelector(".ctp-checkbox-label") ||
+                                       document.querySelector("label");
+                            if (cb) {
+                                cb.click();
+                                return true;
+                            }
+                            return false;
+                        }).catch(() => false);
+
+                        if (!clickedInside) {
+                            const frameEl = await frame.frameElement();
+                            if (frameEl) {
+                                const box = await frameEl.boundingBox();
+                                if (box) {
+                                    await page.mouse.click(box.x + Math.min(30, box.width / 2), box.y + box.height / 2).catch(() => {});
+                                }
+                            }
                         }
                     }
                 }
+            } catch (e) {}
 
+            try {
                 await page.evaluate(() => {
                     const keywords = ["签到", "簽到", "验证", "驗證", "确认", "確認", "立即签到", "Verify", "Check"];
                     const buttons = Array.from(document.querySelectorAll("button, a, div[role='button'], .btn"));
@@ -126,6 +195,11 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                     }
                 }).catch(() => {});
             } catch (e) {}
+
+            if (currentText.includes("验证成功") || currentText.includes("签到成功") || currentText.includes("Verification successful") || currentText.includes("Success")) {
+                addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] 小程序页面已检测到验证成功标识`);
+                break;
+            }
 
             if (sentWebViewData && button) {
                 try {
