@@ -41,6 +41,7 @@ function getChromiumPath() {
 
 async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, deviceConf, botName, maskedPhone) {
     let browser = null;
+    let pageText = "";
     try {
         const executablePath = getChromiumPath();
         addLog(`[🤖 ${botName}] 🌐 [${maskedPhone}] 正在启动内置浏览器加载小程序并执行自动验证...`);
@@ -140,9 +141,12 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
             }
         }
 
+        pageText = await page.evaluate(() => document.body ? (document.body.innerText || "") : "").catch(() => "");
         addLog(`[🤖 ${botName}] ✅ [${maskedPhone}] 小程序运行与验证流程执行完毕`);
+        return { success: true, pageText };
     } catch (err) {
         addLog(`[🤖 ${botName}] ⚠️ [${maskedPhone}] 浏览器运行小程序异常: ${err.message}`);
+        return { success: false, pageText: "" };
     } finally {
         if (browser) {
             try {
@@ -260,7 +264,7 @@ async function clickButtonByKeywords(client, peer, message, keywords, botName) {
     
     for (const row of message.replyMarkup.rows) {
         for (const button of row.buttons) {
-            if (button.text) {
+            if (button.text && button.data) {
                 for (const kw of keywords) {
                     if (button.text.includes(kw)) {
                         addLog(`[🤖 ${botName}] 👉 匹配到按钮: [${button.text}]，正在模拟点击...`);
@@ -389,7 +393,7 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                 let clickRes = await clickButtonByKeywords(client, botEntity, lastBotMsg, keywords, displayName);
                 
                 if (!clickRes.clicked) {
-                    addLog(`[🤖 ${displayName}] ℹ️ [${maskedPhone}] 未找到匹配的按钮 [${step.text}]，跳过此步。`);
+                    addLog(`[🤖 ${displayName}] ℹ️ [${maskedPhone}] 未找到匹配的普通按钮 [${step.text}]，跳过此步。`);
                 } else {
                     let matchedPopup = false;
                     if (clickRes.popupText && checkKeywords && checkKeywords.trim() !== "") {
@@ -428,7 +432,8 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
             if (lastBotMsg && lastBotMsg.replyMarkup && lastBotMsg.replyMarkup.rows) {
                 latestHandledMsgId = Math.max(latestHandledMsgId, lastBotMsg.id);
                 let targetButton = null;
-                const filterKeyword = (step.text && step.text !== '开启') ? step.text.trim() : "";
+                const rawKws = (step.text && step.text !== '开启') ? step.text : "";
+                const keywords = rawKws ? rawKws.split(',').map(k => k.trim()).filter(Boolean) : [];
 
                 for (const row of lastBotMsg.replyMarkup.rows) {
                     for (const btn of row.buttons) {
@@ -440,8 +445,8 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                             )
                         );
                         if (isWebView) {
-                            if (filterKeyword) {
-                                if (btn.text && btn.text.includes(filterKeyword)) {
+                            if (keywords.length > 0) {
+                                if (btn.text && keywords.some(kw => btn.text.includes(kw))) {
                                     targetButton = btn;
                                     break;
                                 }
@@ -455,12 +460,13 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                 }
 
                 if (!targetButton) {
-                    addLog(`[🤖 ${displayName}] ⚠️ [${maskedPhone}] 未在最新消息中找到小程序按钮，跳过此步。`);
+                    addLog(`[🤖 ${displayName}] ⚠️ [${maskedPhone}] 未在最新消息中找到匹配 [${rawKws || '任意'}] 的小程序按钮，跳过此步。`);
                 } else {
                     addLog(`[🤖 ${displayName}] 🚀 [${maskedPhone}] 检测到小程序按钮 [${targetButton.text}]，正在唤出小程序...`);
                     let lastMsgId = lastBotMsg.id;
                     let lastText = lastBotMsg.text;
                     let lastMarkupStr = JSON.stringify(lastBotMsg.replyMarkup);
+                    let miniRes = { success: false, pageText: "" };
 
                     try {
                         const themeParams = new Api.DataJSON({
@@ -494,7 +500,7 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                         }
 
                         if (webViewResult && webViewResult.url) {
-                            await runMiniAppInHeadlessBrowser(
+                            miniRes = await runMiniAppInHeadlessBrowser(
                                 client,
                                 botEntity,
                                 targetButton,
@@ -508,11 +514,17 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                         addLog(`[🤖 ${displayName}] ⚠️ 唤出小程序异常: ${webErr.message}`);
                     }
 
-                    let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 15000);
-                    if (response) {
-                        finalResultText = response.text;
-                    } else {
-                        finalResultText = "";
+                    let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 10000);
+                    let botMsgText = response ? (response.text || "") : "";
+                    if (!botMsgText) {
+                        let checkMsgs = await client.getMessages(botEntity, { limit: 3 });
+                        let latest = checkMsgs.find(m => !m.out);
+                        if (latest && latest.text) botMsgText = latest.text;
+                    }
+
+                    finalResultText = [miniRes.pageText, botMsgText].filter(Boolean).join(" ");
+                    if (finalResultText) {
+                        addLog(`[🤖 ${displayName}] 📋 [${maskedPhone}] 验证反馈内容: ${finalResultText.replace(/\n/g, ' ').substring(0, 80)}...`);
                     }
                 }
             } else {
@@ -622,65 +634,77 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                 }));
                 
                 if (webViewResult && webViewResult.url) {
-                    let tgWebAppDataEncoded = "";
-                    let tgWebAppDataDecoded = "";
-                    const match = webViewResult.url.match(/tgWebAppData=([^&]+)/);
-                    
-                    if (match && match[1]) {
-                        tgWebAppDataEncoded = match[1];
-                        tgWebAppDataDecoded = decodeURIComponent(match[1]);
-                        
-                        addLog(`[🤖 ${displayName}] ✅ [${maskedPhone}] 成功获取动态鉴权数据!`);
-                        
-                        let fetchOptions = {};
-                        let apiUrl = "";
+                    if (step.type === 'webapp' && (!step.apiUrl || step.apiUrl === 'auto' || step.apiUrl === 'browser')) {
+                        let messagesBefore = await client.getMessages(botEntity, { limit: 5 });
+                        let lastBotMsgBefore = messagesBefore.find(m => !m.out);
+                        let lastMsgId = lastBotMsgBefore ? lastBotMsgBefore.id : 0;
+                        let lastText = lastBotMsgBefore ? lastBotMsgBefore.text : "";
+                        let lastMarkupStr = (lastBotMsgBefore && lastBotMsgBefore.replyMarkup) ? JSON.stringify(lastBotMsgBefore.replyMarkup) : "";
 
-                        if (step.type === 'webapp_json') {
-                            const replaceVars = (obj) => {
-                                if (typeof obj === 'string') {
-                                    return obj.replace(/\{\{tgWebAppData\}\}/g, tgWebAppDataEncoded)
-                                              .replace(/\{\{tgWebAppData_decoded\}\}/g, tgWebAppDataDecoded);
-                                } else if (Array.isArray(obj)) {
-                                    return obj.map(replaceVars);
-                                } else if (typeof obj === 'object' && obj !== null) {
-                                    let res = {};
-                                    for (let k in obj) res[k] = replaceVars(obj[k]);
-                                    return res;
-                                }
-                                return obj;
-                            };
-
-                            let finalConfig = replaceVars(step.config);
-                            apiUrl = finalConfig.apiUrl;
-                            const customHeaders = finalConfig.headers || {};
-                            if (!customHeaders['User-Agent'] && !customHeaders['user-agent']) {
-                                customHeaders['User-Agent'] = deviceConf.userAgent;
-                            }
-                            fetchOptions = {
-                                method: finalConfig.method || 'POST',
-                                headers: customHeaders,
-                                body: finalConfig.body ? (typeof finalConfig.body === 'string' ? finalConfig.body : JSON.stringify(finalConfig.body)) : undefined
-                            };
-                        } else {
-                            apiUrl = step.apiUrl;
-                            fetchOptions = {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/json',
-                                    'Authorization': `Bearer ${tgWebAppDataDecoded}`,
-                                    'User-Agent': deviceConf.userAgent
-                                },
-                                body: JSON.stringify({ action: 'checkin', tgWebAppData: tgWebAppDataDecoded })
-                            };
-                        }
-                        
-                        await randomDelay(2000, 4000);
-                        const response = await fetch(apiUrl, fetchOptions);
-                        const resText = await response.text();
-                        finalResultText = resText;
-                        addLog(`[🤖 ${displayName}] 🎁 [${maskedPhone}] 小程序返回: ${resText.substring(0, 150)}`);
+                        await runMiniAppInHeadlessBrowser(client, botEntity, null, webViewResult.url, deviceConf, displayName, maskedPhone);
+                        let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 12000);
+                        if (response) finalResultText = response.text;
                     } else {
-                        addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 无法从返回 URL 中提取 tgWebAppData`);
+                        let tgWebAppDataEncoded = "";
+                        let tgWebAppDataDecoded = "";
+                        const match = webViewResult.url.match(/tgWebAppData=([^&]+)/);
+                        
+                        if (match && match[1]) {
+                            tgWebAppDataEncoded = match[1];
+                            tgWebAppDataDecoded = decodeURIComponent(match[1]);
+                            
+                            addLog(`[🤖 ${displayName}] ✅ [${maskedPhone}] 成功获取动态鉴权数据!`);
+                            
+                            let fetchOptions = {};
+                            let apiUrl = "";
+
+                            if (step.type === 'webapp_json') {
+                                const replaceVars = (obj) => {
+                                    if (typeof obj === 'string') {
+                                        return obj.replace(/\{\{tgWebAppData\}\}/g, tgWebAppDataEncoded)
+                                                  .replace(/\{\{tgWebAppData_decoded\}\}/g, tgWebAppDataDecoded);
+                                    } else if (Array.isArray(obj)) {
+                                        return obj.map(replaceVars);
+                                    } else if (typeof obj === 'object' && obj !== null) {
+                                        let res = {};
+                                        for (let k in obj) res[k] = replaceVars(obj[k]);
+                                        return res;
+                                    }
+                                    return obj;
+                                };
+
+                                let finalConfig = replaceVars(step.config);
+                                apiUrl = finalConfig.apiUrl;
+                                const customHeaders = finalConfig.headers || {};
+                                if (!customHeaders['User-Agent'] && !customHeaders['user-agent']) {
+                                    customHeaders['User-Agent'] = deviceConf.userAgent;
+                                }
+                                fetchOptions = {
+                                    method: finalConfig.method || 'POST',
+                                    headers: customHeaders,
+                                    body: finalConfig.body ? (typeof finalConfig.body === 'string' ? finalConfig.body : JSON.stringify(finalConfig.body)) : undefined
+                                };
+                            } else {
+                                apiUrl = step.apiUrl;
+                                fetchOptions = {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json',
+                                        'Authorization': `Bearer ${tgWebAppDataDecoded}`,
+                                        'User-Agent': deviceConf.userAgent
+                                    },
+                                    body: JSON.stringify({ action: 'checkin', tgWebAppData: tgWebAppDataDecoded })
+                                };
+                            }
+                            
+                            await randomDelay(2000, 4000);
+                            const response = await fetch(apiUrl, fetchOptions);
+                            const resText = await response.text();
+                            finalResultText = resText;
+                            addLog(`[🤖 ${displayName}] 🎁 [${maskedPhone}] 小程序返回: ${resText.substring(0, 150)}`);
+                        } else {
+                            addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 无法从返回 URL 中提取 tgWebAppData`);
+                        }
                     }
                 }
             } catch (e) {

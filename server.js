@@ -141,7 +141,6 @@ app.get("/", (req, res) => {
 app.get("/api/events", (req, res) => {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
-    res.setHeader("Connection", "keep-alive");
     res.flushHeaders();
 
     const onDataChanged = () => {
@@ -400,9 +399,7 @@ function parseStepsFromText(stepsStr) {
             newSteps.push({ type: 'ai_captcha' });
         } else if (line.startsWith('小程序:') || line.startsWith('小程序：')) {
             let content = line.substring(4).trim();
-            if (content === '开启') {
-                newSteps.push({ type: 'miniapp_open' });
-            } else if (content.startsWith('{')) {
+            if (content.startsWith('{')) {
                 try {
                     let config = JSON.parse(content);
                     newSteps.push({ type: 'webapp_json', config: config });
@@ -415,7 +412,8 @@ function parseStepsFromText(stepsStr) {
                     newSteps.push({ type: 'webapp', webAppUrl: parts[0].trim(), apiUrl: parts[1].trim() });
                 }
             } else {
-                newSteps.push({ type: 'miniapp_open', text: content });
+                const kw = (content === '开启' || content === '') ? "" : content;
+                newSteps.push({ type: 'miniapp_open', text: kw });
             }
         }
     });

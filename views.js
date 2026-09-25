@@ -66,20 +66,22 @@ function renderBotsHtml() {
             if (s.type === 'send_delete') return `发送并撤回: ${s.text}`;
             if (s.type === 'click') return `点击: ${s.text}`;
             if (s.type === 'ai_captcha') return `Ai识别`;
+            if (s.type === 'miniapp_open') return s.text ? `小程序: ${s.text}` : `小程序: 开启`;
             if (s.type === 'webapp') return `小程序: ${s.webAppUrl} | ${s.apiUrl}`;
             if (s.type === 'webapp_json') return `小程序: ${JSON.stringify(s.config)}`;
             return '';
-        }).join('\n');
+        }).filter(Boolean).join('\n');
 
         const renewStepsStr = (b.renewSteps || []).map(s => {
             if (s.type === 'send') return `发送: ${s.text}`;
             if (s.type === 'send_delete') return `发送并撤回: ${s.text}`;
             if (s.type === 'click') return `点击: ${s.text}`;
             if (s.type === 'ai_captcha') return `Ai识别`;
+            if (s.type === 'miniapp_open') return s.text ? `小程序: ${s.text}` : `小程序: 开启`;
             if (s.type === 'webapp') return `小程序: ${s.webAppUrl} | ${s.apiUrl}`;
             if (s.type === 'webapp_json') return `小程序: ${JSON.stringify(s.config)}`;
             return '';
-        }).join('\n');
+        }).filter(Boolean).join('\n');
 
         let timesHtml = "";
         if (b.enabledAccounts && b.enabledAccounts.length > 0) {
@@ -268,7 +270,7 @@ function renderBotsHtml() {
 
                         <div style="margin-bottom:8px;">
                             <label style="display:block; margin-bottom:4px; font-weight:600; color:var(--text);">签到步骤配置:</label>
-                            <textarea name="stepsStr" rows="3" class="custom-textarea" placeholder="发送: /start&#10;发送并撤回: 签到&#10;Ai识别&#10;点击: 签到" style="margin:0;">${stepsStr}</textarea>
+                            <textarea name="stepsStr" rows="3" class="custom-textarea" placeholder="发送: /start&#10;发送并撤回: 签到&#10;小程序: 签到&#10;点击: 签到" style="margin:0;">${stepsStr}</textarea>
                         </div>
 
                         <div style="margin-bottom:8px;">
