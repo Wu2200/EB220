@@ -39,6 +39,70 @@ function getChromiumPath() {
     return "/usr/bin/chromium-browser";
 }
 
+async function locateTurnstileBox(page) {
+    const frames = page.frames();
+    for (const frame of frames) {
+        const url = frame.url();
+        if (url.includes("challenges.cloudflare.com") || url.includes("turnstile") || url.includes("cf-chl")) {
+            try {
+                const frameEl = await frame.frameElement();
+                if (frameEl) {
+                    await frameEl.evaluate(el => el.scrollIntoView({ block: 'center', inline: 'center' })).catch(() => {});
+                    await sleep(100);
+                    const box = await frameEl.boundingBox();
+                    if (box && box.width > 20 && box.height > 20) {
+                        return { x: box.x, y: box.y, width: box.width, height: box.height, source: "frame" };
+                    }
+                }
+            } catch (e) {}
+        }
+    }
+
+    try {
+        const pierceIframes = await page.$$("pierce/iframe");
+        for (const ifr of pierceIframes) {
+            const src = await ifr.evaluate(el => el.src || "").catch(() => "");
+            if (src.includes("challenges.cloudflare.com") || src.includes("turnstile") || src.includes("cf-chl")) {
+                await ifr.evaluate(el => el.scrollIntoView({ block: 'center', inline: 'center' })).catch(() => {});
+                await sleep(100);
+                const box = await ifr.boundingBox();
+                if (box && box.width > 20 && box.height > 20) {
+                    return { x: box.x, y: box.y, width: box.width, height: box.height, source: "pierce" };
+                }
+            }
+        }
+    } catch (e) {}
+
+    const shadowBox = await page.evaluate(() => {
+        function search(root) {
+            if (!root) return null;
+            const iframes = root.querySelectorAll('iframe');
+            for (const ifr of iframes) {
+                const src = ifr.src || '';
+                if (src.includes('challenges.cloudflare.com') || src.includes('turnstile') || src.includes('cf-chl')) {
+                    const r = ifr.getBoundingClientRect();
+                    if (r.width > 20 && r.height > 20) return { x: r.left, y: r.top, width: r.width, height: r.height };
+                }
+            }
+            const all = root.querySelectorAll('*');
+            for (const el of all) {
+                if (el.shadowRoot) {
+                    const found = search(el.shadowRoot);
+                    if (found) return found;
+                }
+            }
+            return null;
+        }
+        return search(document);
+    }).catch(() => null);
+
+    if (shadowBox && shadowBox.width > 20 && shadowBox.height > 20) {
+        return { ...shadowBox, source: "shadow" };
+    }
+
+    return null;
+}
+
 async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, deviceConf, botName, maskedPhone) {
     let browser = null;
     let pageText = "";
@@ -73,6 +137,7 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
         let sentWebViewData = null;
         let lastChallenge = "";
         let lastSiteKey = "";
+        let apiCheckinSuccess = false;
 
         page.on("console", (msg) => {
             const txt = msg.text();
@@ -102,6 +167,9 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                         if (parsed && parsed.data) {
                             if (parsed.data.challenge) lastChallenge = parsed.data.challenge;
                             if (parsed.data.site_key) lastSiteKey = parsed.data.site_key;
+                        }
+                        if (body.includes("success") || body.includes("成功") || body.includes('"code":0') || (parsed && parsed.data && parsed.data.status === "success")) {
+                            apiCheckinSuccess = true;
                         }
                     } catch (e) {}
                 } catch (e) {}
@@ -279,20 +347,14 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
         let lastLoggedSummary = "";
         let clickedTab = false;
 
-        while (Date.now() - startWait < 50000 && !webAppClosed) {
+        while (Date.now() - startWait < 85000 && !webAppClosed) {
             await sleep(1500);
 
             const pageSummary = await page.evaluate(() => {
                 const text = document.body ? (document.body.innerText || "").replace(/\s+/g, " ").trim() : "";
-                const ifrList = Array.from(document.querySelectorAll("iframe")).map(f => ({
-                    src: f.src || '',
-                    w: f.offsetWidth,
-                    h: f.offsetHeight
-                }));
                 const hasTurnstileInput = Boolean(document.querySelector('input[name="cf-turnstile-response"]') || document.querySelector('textarea[name="cf-turnstile-response"]'));
-                const hasTurnstileObj = Boolean(window.turnstile);
-                return { text, ifrList, hasTurnstileInput, hasTurnstileObj };
-            }).catch(() => ({ text: "", ifrList: [], hasTurnstileInput: false, hasTurnstileObj: false }));
+                return { text, hasTurnstileInput };
+            }).catch(() => ({ text: "", hasTurnstileInput: false }));
 
             const currentText = pageSummary.text;
 
@@ -335,60 +397,41 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
             }
 
             const now = Date.now();
-            try {
-                const iframes = await page.$$("iframe");
-                for (const ifr of iframes) {
-                    const src = await ifr.evaluate(el => el.src || "").catch(() => "");
-                    const isCf = src.includes("challenges.cloudflare.com") || src.includes("turnstile") || src.includes("cf-chl") || src === "" || src.includes("about:blank");
-                    if (isCf) {
-                        await ifr.evaluate(el => el.scrollIntoView({ block: 'center', inline: 'center' })).catch(() => {});
-                        await sleep(200);
+            if (now - turnstileClickTime > 4000) {
+                const targetBox = await locateTurnstileBox(page);
+                if (targetBox) {
+                    turnstileClickTime = Date.now();
+                    const clickX = targetBox.x + Math.min(35, Math.max(25, targetBox.width * 0.12));
+                    const clickY = targetBox.y + targetBox.height / 2;
+                    addLog(`[🤖 ${botName}] 👆 [${maskedPhone}] 成功定位 Cloudflare 验证框 (${Math.round(targetBox.width)}x${Math.round(targetBox.height)}, 来源: ${targetBox.source})，执行模拟物理点击...`);
+                    await page.mouse.move(targetBox.x + 2, targetBox.y + 2);
+                    await sleep(60);
+                    await page.mouse.move(clickX, clickY, { steps: 6 });
+                    await sleep(80);
+                    await page.mouse.down();
+                    await sleep(120);
+                    await page.mouse.up();
+                }
+            }
 
-                        const box = await ifr.boundingBox();
-                        if (box && box.width > 20 && box.height > 20 && now - turnstileClickTime > 6000) {
-                            turnstileClickTime = Date.now();
-                            addLog(`[🤖 ${botName}] 👆 [${maskedPhone}] 成功定位 Cloudflare 验证框 (尺寸: ${Math.round(box.width)}x${Math.round(box.height)})，执行模拟点击...`);
-                            
-                            const clickX = box.x + Math.min(32, Math.max(16, box.width * 0.12));
-                            const clickY = box.y + box.height / 2;
-                            await page.mouse.move(box.x + 2, box.y + 2);
-                            await sleep(50);
-                            await page.mouse.move(clickX, clickY, { steps: 5 });
-                            await sleep(60);
-                            await page.mouse.down();
-                            await sleep(90);
-                            await page.mouse.up();
-                            break;
+            const currentToken = await page.evaluate(() => {
+                const inputs = Array.from(document.querySelectorAll('input[name*="turnstile"], textarea[name*="turnstile"]'));
+                for (const inp of inputs) {
+                    if (inp.value && inp.value.length > 20) return inp.value;
+                }
+                const all = document.querySelectorAll('*');
+                for (const el of all) {
+                    if (el.shadowRoot) {
+                        const sInputs = el.shadowRoot.querySelectorAll('input[name*="turnstile"], textarea[name*="turnstile"]');
+                        for (const inp of sInputs) {
+                            if (inp.value && inp.value.length > 20) return inp.value;
                         }
                     }
                 }
-            } catch (e) {}
-
-            try {
-                const frames = page.frames();
-                for (const frame of frames) {
-                    const frameUrl = frame.url();
-                    if (frameUrl.includes("challenges.cloudflare.com") || frameUrl.includes("turnstile") || frameUrl.includes("cf-chl")) {
-                        await frame.evaluate(() => {
-                            const cb = document.querySelector("input[type='checkbox']") ||
-                                       document.querySelector("#challenge-stage") ||
-                                       document.querySelector(".ctp-checkbox-label") ||
-                                       document.querySelector("label");
-                            if (cb) cb.click();
-                        }).catch(() => {});
-                    }
-                }
-            } catch (e) {}
-
-            const currentToken = await page.evaluate(() => {
-                const cfInput = document.querySelector('input[name="cf-turnstile-response"]') || 
-                                document.querySelector('textarea[name="cf-turnstile-response"]') ||
-                                document.querySelector('[name*="turnstile"]');
-                if (cfInput && cfInput.value && cfInput.value.length > 10) return cfInput.value;
                 if (window.turnstile && typeof window.turnstile.getResponse === "function") {
                     try {
                         const t = window.turnstile.getResponse();
-                        if (t && t.length > 10) return t;
+                        if (t && t.length > 20) return t;
                     } catch (e) {}
                 }
                 return null;
@@ -399,16 +442,16 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] 成功获取 Cloudflare 验证 Token: ${currentToken.substring(0, 16)}...`);
                 await sleep(1000);
 
-                await page.evaluate((tok) => {
+                await page.evaluate(() => {
                     const submits = Array.from(document.querySelectorAll("button, a, div[role='button'], input[type='submit'], .btn"));
                     for (const b of submits) {
                         const t = (b.innerText || b.textContent || b.value || "").trim();
-                        if (t.includes("签到") || t.includes("提交") || t.includes("完成") || t.includes("确定") || t.includes("Submit")) {
+                        if (t.includes("签到") || t.includes("提交") || t.includes("完成") || t.includes("确定") || t.includes("Submit") || t.includes("验证")) {
                             b.click();
                             break;
                         }
                     }
-                }, currentToken).catch(() => {});
+                }).catch(() => {});
 
                 if (lastChallenge && rawTgWebAppData) {
                     await page.evaluate(async (initData, ch, tk) => {
@@ -436,7 +479,7 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 }
             }
 
-            if (currentText.includes("签到成功") || currentText.includes("验证成功") || currentText.includes("今日已签到") || currentText.includes("Success")) {
+            if (apiCheckinSuccess || currentText.includes("签到成功") || currentText.includes("验证成功") || currentText.includes("今日已签到") || currentText.includes("Success")) {
                 addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] 小程序页面已检测到验证成功标识`);
                 break;
             }
