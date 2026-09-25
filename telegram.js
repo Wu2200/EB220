@@ -57,7 +57,6 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 "--no-zygote",
                 "--disable-gpu",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
                 "--lang=zh-CN,zh",
                 "--window-size=390,844"
             ]
@@ -69,7 +68,18 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
 
         let webAppClosed = false;
         let sentWebViewData = null;
-        let capturedTurnstileToken = null;
+
+        page.on("console", (msg) => {
+            const txt = msg.text();
+            if (msg.type() === "error" || txt.includes("error") || txt.includes("Error") || txt.includes("Fail") || txt.includes("fail") || txt.includes("turnstile")) {
+                addLog(`[🤖 ${botName}] 🌐 页面控制台 [${msg.type()}]: ${txt.substring(0, 120)}`);
+            }
+        });
+
+        page.on("requestfailed", (req) => {
+            const fail = req.failure();
+            addLog(`[🤖 ${botName}] ⚠️ 资源加载失败: ${req.url().substring(0, 80)} (${fail ? fail.errorText : ""})`);
+        });
 
         await page.exposeFunction("__tgBridgeEvent", async (eventType, eventData) => {
             if (eventType === "web_app_data_send" && eventData) {
@@ -85,13 +95,6 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
             }
         });
 
-        await page.exposeFunction("__cfTokenReady", async (token) => {
-            if (token && typeof token === "string" && token.length > 10) {
-                capturedTurnstileToken = token;
-                addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] Cloudflare Turnstile 验证回调已触发，获取 Token！`);
-            }
-        });
-
         let rawHash = "";
         let initParamsMap = {};
         try {
@@ -102,15 +105,15 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 for (const pair of pairs) {
                     const eqIdx = pair.indexOf("=");
                     if (eqIdx !== -1) {
-                        const k = pair.substring(0, eqIdx);
-                        const v = pair.substring(eqIdx + 1);
+                        const k = decodeURIComponent(pair.substring(0, eqIdx));
+                        const v = decodeURIComponent(pair.substring(eqIdx + 1));
                         initParamsMap[k] = v;
                     }
                 }
             }
         } catch (e) {}
 
-        const rawTgWebAppData = initParamsMap["tgWebAppData"] ? decodeURIComponent(initParamsMap["tgWebAppData"]) : "";
+        const rawTgWebAppData = initParamsMap["tgWebAppData"] || "";
 
         await page.evaluateOnNewDocument((params, rawInitData, fullHash) => {
             try {
@@ -159,31 +162,6 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                     sessionStorage.setItem("__telegram__initParams", JSON.stringify(params));
                 }
             } catch (e) {}
-
-            let _internalTurnstile = window.turnstile;
-            Object.defineProperty(window, "turnstile", {
-                configurable: true,
-                get: () => _internalTurnstile,
-                set: (val) => {
-                    _internalTurnstile = val;
-                    if (val && typeof val.render === "function" && !val._intercepted) {
-                        const origRender = val.render;
-                        val.render = function (container, options) {
-                            if (options && options.callback) {
-                                const origCb = options.callback;
-                                options.callback = function (token) {
-                                    try {
-                                        if (window.__cfTokenReady) window.__cfTokenReady(token);
-                                    } catch (e) {}
-                                    return origCb.apply(this, arguments);
-                                };
-                            }
-                            return origRender.apply(this, arguments);
-                        };
-                        val._intercepted = true;
-                    }
-                }
-            });
 
             const bridgeHandler = function (eventType, eventData) {
                 if (typeof window.__tgBridgeEvent === "function") {
@@ -264,7 +242,7 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
             }
         });
 
-        await page.goto(webViewUrl, { waitUntil: "networkidle2", timeout: 30000 }).catch(() => {});
+        await page.goto(webViewUrl, { waitUntil: "domcontentloaded", timeout: 25000 }).catch(() => {});
 
         try {
             await page.evaluate(() => {
@@ -286,10 +264,10 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
 
             const pageSummary = await page.evaluate(() => {
                 const text = document.body ? (document.body.innerText || "").replace(/\s+/g, " ").trim() : "";
-                const hasIframe = Boolean(document.querySelector("iframe"));
+                const ifrCount = document.querySelectorAll("iframe").length;
                 const hasTurnstileInput = Boolean(document.querySelector('input[name="cf-turnstile-response"]'));
-                return { text, hasIframe, hasTurnstileInput };
-            }).catch(() => ({ text: "", hasIframe: false, hasTurnstileInput: false }));
+                return { text, ifrCount, hasTurnstileInput };
+            }).catch(() => ({ text: "", ifrCount: 0, hasTurnstileInput: false }));
 
             const currentText = pageSummary.text;
 
@@ -342,32 +320,30 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
             }
 
             const now = Date.now();
-            if (now - turnstileClickTime > 8000) {
-                try {
-                    const iframes = await page.$$("iframe");
-                    for (const ifr of iframes) {
-                        const box = await ifr.boundingBox();
-                        if (box && box.width > 20 && box.height > 20) {
-                            const src = await ifr.evaluate(el => el.src || "").catch(() => "");
-                            const isCf = src.includes("challenges.cloudflare.com") || src.includes("turnstile") || src.includes("cf-chl") || src === "" || src.includes("about:blank");
-                            if (isCf) {
-                                turnstileClickTime = Date.now();
-                                addLog(`[🤖 ${botName}] 👆 [${maskedPhone}] 检测到 Cloudflare 验证框，正在模拟点击复选框...`);
-                                const clickX = box.x + Math.min(32, Math.max(16, box.width * 0.15));
-                                const clickY = box.y + box.height / 2;
-                                await page.mouse.move(box.x + 2, box.y + 2);
-                                await sleep(60);
-                                await page.mouse.move(clickX, clickY, { steps: 5 });
-                                await sleep(60);
-                                await page.mouse.down();
-                                await sleep(90);
-                                await page.mouse.up();
-                                break;
-                            }
+            try {
+                const iframes = await page.$$("iframe");
+                for (const ifr of iframes) {
+                    const box = await ifr.boundingBox();
+                    if (box && box.width > 20 && box.height > 20) {
+                        const src = await ifr.evaluate(el => el.src || "").catch(() => "");
+                        const isCf = src.includes("challenges.cloudflare.com") || src.includes("turnstile") || src.includes("cf-chl") || src === "" || src.includes("about:blank");
+                        if (isCf && now - turnstileClickTime > 6000) {
+                            turnstileClickTime = Date.now();
+                            addLog(`[🤖 ${botName}] 👆 [${maskedPhone}] 检测到 Cloudflare 验证框，正在模拟点击复选框...`);
+                            const clickX = box.x + Math.min(32, Math.max(16, box.width * 0.15));
+                            const clickY = box.y + box.height / 2;
+                            await page.mouse.move(box.x + 2, box.y + 2);
+                            await sleep(50);
+                            await page.mouse.move(clickX, clickY, { steps: 5 });
+                            await sleep(50);
+                            await page.mouse.down();
+                            await sleep(90);
+                            await page.mouse.up();
+                            break;
                         }
                     }
-                } catch (e) {}
-            }
+                }
+            } catch (e) {}
 
             try {
                 const frames = page.frames();
@@ -385,18 +361,17 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 }
             } catch (e) {}
 
-            let currentToken = capturedTurnstileToken;
-            if (!currentToken) {
-                currentToken = await page.evaluate(() => {
-                    const cfInput = document.querySelector('input[name="cf-turnstile-response"]') || document.querySelector('textarea[name="cf-turnstile-response"]');
-                    if (cfInput && cfInput.value && cfInput.value.length > 10) return cfInput.value;
-                    if (window.turnstile && typeof window.turnstile.getResponse === "function") {
+            const currentToken = await page.evaluate(() => {
+                const cfInput = document.querySelector('input[name="cf-turnstile-response"]') || document.querySelector('textarea[name="cf-turnstile-response"]');
+                if (cfInput && cfInput.value && cfInput.value.length > 10) return cfInput.value;
+                if (window.turnstile && typeof window.turnstile.getResponse === "function") {
+                    try {
                         const t = window.turnstile.getResponse();
                         if (t && t.length > 10) return t;
-                    }
-                    return null;
-                }).catch(() => null);
-            }
+                    } catch (e) {}
+                }
+                return null;
+            }).catch(() => null);
 
             if (currentToken && !submittedToken) {
                 submittedToken = true;
