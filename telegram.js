@@ -52,9 +52,14 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-accelerated-2d-canvas",
                 "--no-first-run",
                 "--no-zygote",
                 "--disable-gpu",
+                "--disable-web-security",
+                "--allow-running-insecure-content",
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
                 "--disable-blink-features=AutomationControlled",
                 "--lang=zh-CN,zh",
                 "--window-size=390,844"
@@ -62,6 +67,48 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
         });
 
         const page = await browser.newPage();
+        await page.setBypassCSP(true);
+
+        try {
+            const cdp = await page.target().createCDPSession();
+            await cdp.send("Page.setBypassCSP", { enabled: true });
+            await cdp.send("Fetch.enable", {
+                patterns: [
+                    { requestStage: "Response", resourceType: "Document" }
+                ]
+            });
+
+            cdp.on("Fetch.requestPaused", async (event) => {
+                const { requestId, responseHeaders, responseStatusCode } = event;
+                if (responseStatusCode >= 300 && responseStatusCode < 400) {
+                    await cdp.send("Fetch.continueRequest", { requestId }).catch(() => {});
+                    return;
+                }
+                try {
+                    const res = await cdp.send("Fetch.getResponseBody", { requestId });
+                    let body = res.base64Encoded ? Buffer.from(res.body, "base64").toString("utf-8") : res.body;
+
+                    body = body.replace(/<meta[\s\S]*?content-security-policy[\s\S]*?>/gi, "");
+
+                    const cleanHeaders = (responseHeaders || []).filter(h => {
+                        const name = h.name.toLowerCase();
+                        return !name.includes("content-security-policy") &&
+                               name !== "content-encoding" &&
+                               name !== "content-length";
+                    });
+
+                    await cdp.send("Fetch.fulfillRequest", {
+                        requestId,
+                        responseCode: responseStatusCode || 200,
+                        responseHeaders: cleanHeaders,
+                        body: Buffer.from(body).toString("base64")
+                    });
+                } catch (err) {
+                    await cdp.send("Fetch.continueRequest", { requestId }).catch(() => {});
+                }
+            });
+        } catch (e) {}
+
         await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
         
         const androidUA = "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.127 Mobile Safari/537.36";
