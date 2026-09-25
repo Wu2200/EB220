@@ -1,5 +1,3 @@
-const fs = require("fs");
-const puppeteer = require("puppeteer-core");
 const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const {
@@ -23,494 +21,6 @@ const runningAccounts = new Set();
 function randomDelay(minMs, maxMs) {
     const ms = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
     return sleep(ms);
-}
-
-function getChromiumPath() {
-    const candidates = [
-        process.env.PUPPETEER_EXECUTABLE_PATH,
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/google-chrome"
-    ].filter(Boolean);
-    for (const p of candidates) {
-        if (fs.existsSync(p)) return p;
-    }
-    return "/usr/bin/chromium-browser";
-}
-
-async function locateTurnstileBox(page) {
-    const frames = page.frames();
-    for (const frame of frames) {
-        const url = frame.url();
-        if (url.includes("challenges.cloudflare.com") || url.includes("turnstile") || url.includes("cf-chl")) {
-            try {
-                const frameEl = await frame.frameElement();
-                if (frameEl) {
-                    await frameEl.evaluate(el => el.scrollIntoView({ block: 'center', inline: 'center' })).catch(() => {});
-                    await sleep(100);
-                    const box = await frameEl.boundingBox();
-                    if (box && box.width > 20 && box.height > 20) {
-                        return { x: box.x, y: box.y, width: box.width, height: box.height, source: "frame" };
-                    }
-                }
-            } catch (e) {}
-        }
-    }
-
-    try {
-        const pierceIframes = await page.$$("pierce/iframe");
-        for (const ifr of pierceIframes) {
-            const src = await ifr.evaluate(el => el.src || "").catch(() => "");
-            if (src.includes("challenges.cloudflare.com") || src.includes("turnstile") || src.includes("cf-chl")) {
-                await ifr.evaluate(el => el.scrollIntoView({ block: 'center', inline: 'center' })).catch(() => {});
-                await sleep(100);
-                const box = await ifr.boundingBox();
-                if (box && box.width > 20 && box.height > 20) {
-                    return { x: box.x, y: box.y, width: box.width, height: box.height, source: "pierce" };
-                }
-            }
-        }
-    } catch (e) {}
-
-    const shadowBox = await page.evaluate(() => {
-        function search(root) {
-            if (!root) return null;
-            const iframes = root.querySelectorAll('iframe');
-            for (const ifr of iframes) {
-                const src = ifr.src || '';
-                if (src.includes('challenges.cloudflare.com') || src.includes('turnstile') || src.includes('cf-chl')) {
-                    const r = ifr.getBoundingClientRect();
-                    if (r.width > 20 && r.height > 20) return { x: r.left, y: r.top, width: r.width, height: r.height };
-                }
-            }
-            const all = root.querySelectorAll('*');
-            for (const el of all) {
-                if (el.shadowRoot) {
-                    const found = search(el.shadowRoot);
-                    if (found) return found;
-                }
-            }
-            return null;
-        }
-        return search(document);
-    }).catch(() => null);
-
-    if (shadowBox && shadowBox.width > 20 && shadowBox.height > 20) {
-        return { ...shadowBox, source: "shadow" };
-    }
-
-    return null;
-}
-
-async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, deviceConf, botName, maskedPhone) {
-    let browser = null;
-    let pageText = "";
-    try {
-        const executablePath = getChromiumPath();
-        addLog(`[🤖 ${botName}] 🌐 [${maskedPhone}] 正在启动内置浏览器加载小程序并执行自动验证...`);
-        browser = await puppeteer.launch({
-            executablePath,
-            headless: "new",
-            args: [
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-accelerated-2d-canvas",
-                "--no-first-run",
-                "--no-zygote",
-                "--disable-gpu",
-                "--disable-blink-features=AutomationControlled",
-                "--lang=zh-CN,zh",
-                "--window-size=390,1200"
-            ]
-        });
-
-        const page = await browser.newPage();
-        await page.setBypassCSP(true);
-        await page.setViewport({ width: 390, height: 1200, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
-        
-        const androidUA = "Mozilla/5.0 (Linux; Android 14; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6613.127 Mobile Safari/537.36";
-        await page.setUserAgent(androidUA);
-
-        let webAppClosed = false;
-        let sentWebViewData = null;
-        let lastChallenge = "";
-        let lastSiteKey = "";
-        let apiCheckinSuccess = false;
-
-        page.on("console", (msg) => {
-            const txt = msg.text();
-            if (txt.includes("cloudflareinsights") || txt.includes("beacon.min.js")) return;
-            if (msg.type() === "error" || txt.includes("error") || txt.includes("Error") || txt.includes("turnstile") || txt.includes("Turnstile")) {
-                addLog(`[🤖 ${botName}] 🌐 页面控制台 [${msg.type()}]: ${txt.substring(0, 120)}`);
-            }
-        });
-
-        page.on("request", (req) => {
-            const url = req.url();
-            if (url.includes("/checkin") || url.includes("/telegram/") || url.includes("challenges.cloudflare.com")) {
-                const pd = req.postData();
-                addLog(`[🤖 ${botName}] 📤 请求 [${req.method()}]: ${url.substring(0, 65)} ${pd ? `(负载: ${pd.substring(0, 60)})` : ""}`);
-            }
-        });
-
-        page.on("response", async (res) => {
-            const url = res.url();
-            if (url.includes("/checkin") || url.includes("challenges.cloudflare.com") || res.status() >= 400) {
-                if (url.includes("cloudflareinsights.com") || url.includes("google-analytics")) return;
-                let body = "";
-                try {
-                    body = await res.text();
-                    try {
-                        const parsed = JSON.parse(body);
-                        if (parsed && parsed.data) {
-                            if (parsed.data.challenge) lastChallenge = parsed.data.challenge;
-                            if (parsed.data.site_key) lastSiteKey = parsed.data.site_key;
-                        }
-                        if (body.includes("success") || body.includes("成功") || body.includes('"code":0') || (parsed && parsed.data && parsed.data.status === "success")) {
-                            apiCheckinSuccess = true;
-                        }
-                    } catch (e) {}
-                } catch (e) {}
-                addLog(`[🤖 ${botName}] 📥 响应 [${res.status()}]: ${url.substring(0, 65)} -> ${body ? body.substring(0, 100) : "无响应体"}`);
-            }
-        });
-
-        await page.exposeFunction("__tgBridgeEvent", async (eventType, eventData) => {
-            if (eventType === "web_app_data_send" && eventData) {
-                try {
-                    const parsed = typeof eventData === "string" ? JSON.parse(eventData) : eventData;
-                    if (parsed && parsed.data) {
-                        sentWebViewData = String(parsed.data);
-                    }
-                } catch (e) {}
-            }
-            if (eventType === "web_app_close") {
-                webAppClosed = true;
-            }
-        });
-
-        let rawHash = "";
-        let initParamsMap = {};
-        try {
-            const hashIndex = webViewUrl.indexOf("#");
-            if (hashIndex !== -1) {
-                rawHash = webViewUrl.substring(hashIndex + 1);
-                const pairs = rawHash.split("&");
-                for (const pair of pairs) {
-                    const eqIdx = pair.indexOf("=");
-                    if (eqIdx !== -1) {
-                        const k = decodeURIComponent(pair.substring(0, eqIdx));
-                        const v = decodeURIComponent(pair.substring(eqIdx + 1));
-                        initParamsMap[k] = v;
-                    }
-                }
-            }
-        } catch (e) {}
-
-        const rawTgWebAppData = initParamsMap["tgWebAppData"] || "";
-
-        await page.evaluateOnNewDocument((params, rawInitData, fullHash) => {
-            try {
-                try {
-                    delete Object.getPrototypeOf(navigator).webdriver;
-                } catch (e) {}
-                Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-                Object.defineProperty(navigator, "platform", { get: () => "Linux armv81" });
-                Object.defineProperty(navigator, "vendor", { get: () => "Google Inc." });
-                Object.defineProperty(navigator, "maxTouchPoints", { get: () => 5 });
-                Object.defineProperty(navigator, "languages", { get: () => ["zh-CN", "zh", "en-US", "en"] });
-                Object.defineProperty(navigator, "language", { get: () => "zh-CN" });
-
-                if (!window.chrome) {
-                    window.chrome = {
-                        runtime: {},
-                        loadTimes: function () {},
-                        csi: function () {},
-                        app: {}
-                    };
-                }
-
-                if (window.outerWidth === 0) {
-                    Object.defineProperty(window, "outerWidth", { get: () => 390 });
-                    Object.defineProperty(window, "outerHeight", { get: () => 1200 });
-                }
-
-                const origQuery = window.navigator.permissions && window.navigator.permissions.query;
-                if (origQuery) {
-                    window.navigator.permissions.query = (p) => (
-                        p.name === "notifications" ? Promise.resolve({ state: "default" }) : origQuery(p)
-                    );
-                }
-            } catch (e) {}
-
-            try {
-                if (params && Object.keys(params).length > 0) {
-                    sessionStorage.setItem("__telegram__initParams", JSON.stringify(params));
-                }
-            } catch (e) {}
-
-            const bridgeHandler = function (eventType, eventData) {
-                if (typeof window.__tgBridgeEvent === "function") {
-                    window.__tgBridgeEvent(eventType, eventData);
-                }
-            };
-
-            window.TelegramWebviewProxy = {
-                postEvent: bridgeHandler
-            };
-
-            window.webkit = {
-                messageHandlers: {
-                    performAction: {
-                        postMessage: function (data) {
-                            if (!data) return;
-                            try {
-                                const parsed = typeof data === "string" ? JSON.parse(data) : data;
-                                const evtName = parsed.event_name || parsed.eventType || "";
-                                const evtData = parsed.data || parsed.eventData || "";
-                                bridgeHandler(evtName, evtData);
-                            } catch (e) {}
-                        }
-                    }
-                }
-            };
-
-            let parsedUser = null;
-            try {
-                if (rawInitData) {
-                    const sp = new URLSearchParams(rawInitData);
-                    const userStr = sp.get("user");
-                    if (userStr) parsedUser = JSON.parse(userStr);
-                }
-            } catch (e) {}
-
-            window.Telegram = window.Telegram || {};
-            window.Telegram.WebApp = {
-                initData: rawInitData || "",
-                initDataUnsafe: {
-                    query_id: (new URLSearchParams(rawInitData || "")).get("query_id") || "",
-                    user: parsedUser,
-                    auth_date: (new URLSearchParams(rawInitData || "")).get("auth_date") || "",
-                    hash: (new URLSearchParams(rawInitData || "")).get("hash") || ""
-                },
-                version: "7.0",
-                platform: "android",
-                colorScheme: "light",
-                themeParams: {
-                    bg_color: "#ffffff",
-                    text_color: "#000000",
-                    hint_color: "#707579",
-                    link_color: "#3390ec",
-                    button_color: "#3390ec",
-                    button_text_color: "#ffffff"
-                },
-                isExpanded: true,
-                viewportHeight: 1200,
-                viewportStableHeight: 1200,
-                headerColor: "#ffffff",
-                backgroundColor: "#ffffff",
-                BackButton: { isVisible: false, onClick: function () {}, offClick: function () {}, show: function () {}, hide: function () {} },
-                MainButton: { text: "CONTINUE", color: "#3390ec", textColor: "#ffffff", isVisible: false, isActive: true, isProgressVisible: false, setText: function () {}, onClick: function () {}, offClick: function () {}, show: function () {}, hide: function () {}, enable: function () {}, disable: function () {}, showProgress: function () {}, hideProgress: function () {} },
-                HapticFeedback: { impactOccurred: function () {}, notificationOccurred: function () {}, selectionChanged: function () {} },
-                ready: function () { bridgeHandler("web_app_ready"); },
-                expand: function () { bridgeHandler("web_app_expand"); },
-                close: function () { bridgeHandler("web_app_close"); },
-                sendData: function (data) { bridgeHandler("web_app_data_send", { data: String(data) }); },
-                openLink: function (url) { bridgeHandler("web_app_open_link", { url: url }); },
-                openTelegramLink: function (url) { bridgeHandler("web_app_open_tg_link", { path_full: url }); }
-            };
-        }, initParamsMap, rawTgWebAppData, rawHash);
-
-        page.on("pageerror", (err) => {
-            const msg = String(err.message || err);
-            if (!msg.includes("Script error") && !msg.includes("ResizeObserver")) {
-                addLog(`[🤖 ${botName}] ⚠️ 页面异常: ${msg.substring(0, 100)}`);
-            }
-        });
-
-        await page.goto(webViewUrl, { waitUntil: "domcontentloaded", timeout: 25000 }).catch(() => {});
-
-        try {
-            await page.evaluate(() => {
-                if (window.Telegram && window.Telegram.WebApp) {
-                    window.Telegram.WebApp.ready();
-                    window.Telegram.WebApp.expand();
-                }
-            });
-        } catch (e) {}
-
-        const startWait = Date.now();
-        let turnstileClickTime = 0;
-        let submittedToken = false;
-        let lastLoggedSummary = "";
-        let clickedTab = false;
-
-        while (Date.now() - startWait < 85000 && !webAppClosed) {
-            await sleep(1500);
-
-            const pageSummary = await page.evaluate(() => {
-                const text = document.body ? (document.body.innerText || "").replace(/\s+/g, " ").trim() : "";
-                const hasTurnstileInput = Boolean(document.querySelector('input[name="cf-turnstile-response"]') || document.querySelector('textarea[name="cf-turnstile-response"]'));
-                return { text, hasTurnstileInput };
-            }).catch(() => ({ text: "", hasTurnstileInput: false }));
-
-            const currentText = pageSummary.text;
-
-            if (currentText && currentText !== lastLoggedSummary && !currentText.includes(lastLoggedSummary)) {
-                lastLoggedSummary = currentText.substring(0, 60);
-                addLog(`[🤖 ${botName}] 📄 [${maskedPhone}] 页面内容: ${lastLoggedSummary}...`);
-            }
-
-            if (!clickedTab && currentText.includes("人机验证")) {
-                const clickRes = await page.evaluate(() => {
-                    const allEls = Array.from(document.querySelectorAll("button, a, div[role='button'], .card, div, span, p"));
-                    for (const el of allEls) {
-                        const txt = (el.innerText || el.textContent || "").trim();
-                        if (txt === "人机验证" || txt === "点击验证" || txt === "开始验证") {
-                            el.click();
-                            return txt;
-                        }
-                    }
-                    return null;
-                }).catch(() => null);
-
-                if (clickRes) {
-                    clickedTab = true;
-                    addLog(`[🤖 ${botName}] 👉 [${maskedPhone}] 激活验证选项: [${clickRes}]`);
-                    await sleep(2000);
-                }
-            }
-
-            if (currentText.includes("加载超时") || currentText.includes("重新加载") || currentText.includes("网络错误")) {
-                await page.evaluate(() => {
-                    const reloadBtns = Array.from(document.querySelectorAll("button, a, div[role='button'], .btn"));
-                    for (const b of reloadBtns) {
-                        const txt = (b.innerText || b.textContent || "").trim();
-                        if (txt.includes("重新加载") || txt.includes("Reload") || txt.includes("重试")) {
-                            b.click();
-                            break;
-                        }
-                    }
-                }).catch(() => {});
-            }
-
-            const now = Date.now();
-            if (now - turnstileClickTime > 4000) {
-                const targetBox = await locateTurnstileBox(page);
-                if (targetBox) {
-                    turnstileClickTime = Date.now();
-                    const clickX = targetBox.x + Math.min(35, Math.max(25, targetBox.width * 0.12));
-                    const clickY = targetBox.y + targetBox.height / 2;
-                    addLog(`[🤖 ${botName}] 👆 [${maskedPhone}] 成功定位 Cloudflare 验证框 (${Math.round(targetBox.width)}x${Math.round(targetBox.height)}, 来源: ${targetBox.source})，执行模拟物理点击...`);
-                    await page.mouse.move(targetBox.x + 2, targetBox.y + 2);
-                    await sleep(60);
-                    await page.mouse.move(clickX, clickY, { steps: 6 });
-                    await sleep(80);
-                    await page.mouse.down();
-                    await sleep(120);
-                    await page.mouse.up();
-                }
-            }
-
-            const currentToken = await page.evaluate(() => {
-                const inputs = Array.from(document.querySelectorAll('input[name*="turnstile"], textarea[name*="turnstile"]'));
-                for (const inp of inputs) {
-                    if (inp.value && inp.value.length > 20) return inp.value;
-                }
-                const all = document.querySelectorAll('*');
-                for (const el of all) {
-                    if (el.shadowRoot) {
-                        const sInputs = el.shadowRoot.querySelectorAll('input[name*="turnstile"], textarea[name*="turnstile"]');
-                        for (const inp of sInputs) {
-                            if (inp.value && inp.value.length > 20) return inp.value;
-                        }
-                    }
-                }
-                if (window.turnstile && typeof window.turnstile.getResponse === "function") {
-                    try {
-                        const t = window.turnstile.getResponse();
-                        if (t && t.length > 20) return t;
-                    } catch (e) {}
-                }
-                return null;
-            }).catch(() => null);
-
-            if (currentToken && !submittedToken) {
-                submittedToken = true;
-                addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] 成功获取 Cloudflare 验证 Token: ${currentToken.substring(0, 16)}...`);
-                await sleep(1000);
-
-                await page.evaluate(() => {
-                    const submits = Array.from(document.querySelectorAll("button, a, div[role='button'], input[type='submit'], .btn"));
-                    for (const b of submits) {
-                        const t = (b.innerText || b.textContent || b.value || "").trim();
-                        if (t.includes("签到") || t.includes("提交") || t.includes("完成") || t.includes("确定") || t.includes("Submit") || t.includes("验证")) {
-                            b.click();
-                            break;
-                        }
-                    }
-                }).catch(() => {});
-
-                if (lastChallenge && rawTgWebAppData) {
-                    await page.evaluate(async (initData, ch, tk) => {
-                        try {
-                            const pathname = window.location.pathname || "";
-                            let apiUrl = "/api/v1/servers/server-1/telegram/checkin";
-                            if (pathname.includes("/servers/")) {
-                                const match = pathname.match(/\/servers\/([^\/]+)/);
-                                if (match && match[1]) {
-                                    apiUrl = `/api/v1/servers/${match[1]}/telegram/checkin`;
-                                }
-                            }
-                            await fetch(apiUrl, {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({
-                                    init_data: initData,
-                                    challenge: ch,
-                                    token: tk,
-                                    turnstile_token: tk
-                                })
-                            });
-                        } catch (e) {}
-                    }, rawTgWebAppData, lastChallenge, currentToken).catch(() => {});
-                }
-            }
-
-            if (apiCheckinSuccess || currentText.includes("签到成功") || currentText.includes("验证成功") || currentText.includes("今日已签到") || currentText.includes("Success")) {
-                addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] 小程序页面已检测到验证成功标识`);
-                break;
-            }
-
-            if (sentWebViewData && button) {
-                try {
-                    await client.invoke(new Api.messages.SendWebViewData({
-                        bot: peer,
-                        randomId: BigInt(Math.floor(Math.random() * 1e15)),
-                        buttonText: button.text || "签到",
-                        data: sentWebViewData
-                    }));
-                    addLog(`[🤖 ${botName}] 📤 [${maskedPhone}] 已向机器人回传小程序验证数据`);
-                    break;
-                } catch (e) {}
-            }
-        }
-
-        pageText = await page.evaluate(() => document.body ? (document.body.innerText || "") : "").catch(() => "");
-        addLog(`[🤖 ${botName}] ✅ [${maskedPhone}] 小程序运行与验证流程执行完毕`);
-        return { success: true, pageText };
-    } catch (err) {
-        addLog(`[🤖 ${botName}] ⚠️ [${maskedPhone}] 浏览器运行小程序异常: ${err.message}`);
-        return { success: false, pageText: "" };
-    } finally {
-        if (browser) {
-            try {
-                await browser.close();
-            } catch (e) {}
-        }
-    }
 }
 
 async function callModel(endpoint, key, model, base64Image, options, timeoutMs) {
@@ -621,7 +131,7 @@ async function clickButtonByKeywords(client, peer, message, keywords, botName) {
     
     for (const row of message.replyMarkup.rows) {
         for (const button of row.buttons) {
-            if (button.text && button.data) {
+            if (button.text) {
                 for (const kw of keywords) {
                     if (button.text.includes(kw)) {
                         addLog(`[🤖 ${botName}] 👉 匹配到按钮: [${button.text}]，正在模拟点击...`);
@@ -742,15 +252,11 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
 
             if (lastBotMsg) {
                 latestHandledMsgId = Math.max(latestHandledMsgId, lastBotMsg.id);
-                let lastMsgId = lastBotMsg.id;
-                let lastText = lastBotMsg.text;
-                let lastMarkupStr = lastBotMsg.replyMarkup ? JSON.stringify(lastBotMsg.replyMarkup) : "";
-
                 let keywords = step.text.split(',').map(k => k.trim()).filter(k => k);
                 let clickRes = await clickButtonByKeywords(client, botEntity, lastBotMsg, keywords, displayName);
                 
                 if (!clickRes.clicked) {
-                    addLog(`[🤖 ${displayName}] ℹ️ [${maskedPhone}] 未找到匹配的普通按钮 [${step.text}]，跳过此步。`);
+                    addLog(`[🤖 ${displayName}] ℹ️ [${maskedPhone}] 未找到匹配的按钮 [${step.text}]，跳过此步。`);
                 } else {
                     let matchedPopup = false;
                     if (clickRes.popupText && checkKeywords && checkKeywords.trim() !== "") {
@@ -766,6 +272,10 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                         forceSuccess = true;
                         break;
                     } else {
+                        let lastMsgId = lastBotMsg.id;
+                        let lastText = lastBotMsg.text;
+                        let lastMarkupStr = lastBotMsg.replyMarkup ? JSON.stringify(lastBotMsg.replyMarkup) : "";
+
                         let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 12000);
                         if (response) {
                             finalResultText = response.text;
@@ -779,113 +289,6 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                 }
             } else {
                 addLog(`[🤖 ${displayName}] ⚠️ 未找到历史消息，无法点击。`);
-            }
-        }
-        else if (step.type === 'miniapp_open') {
-            await randomDelay(1500, 2500);
-            let messages = await client.getMessages(botEntity, { limit: 5 });
-            let lastBotMsg = messages.find(m => !m.out);
-
-            if (lastBotMsg && lastBotMsg.replyMarkup && lastBotMsg.replyMarkup.rows) {
-                latestHandledMsgId = Math.max(latestHandledMsgId, lastBotMsg.id);
-                let targetButton = null;
-                const rawKws = (step.text && step.text !== '开启') ? step.text : "";
-                const keywords = rawKws ? rawKws.split(',').map(k => k.trim()).filter(Boolean) : [];
-
-                for (const row of lastBotMsg.replyMarkup.rows) {
-                    for (const btn of row.buttons) {
-                        const isWebView = Boolean(
-                            btn.url && (
-                                btn.className === "KeyboardButtonWebView" ||
-                                btn.className === "KeyboardButtonSimpleWebView" ||
-                                !btn.data
-                            )
-                        );
-                        if (isWebView) {
-                            if (keywords.length > 0) {
-                                if (btn.text && keywords.some(kw => btn.text.includes(kw))) {
-                                    targetButton = btn;
-                                    break;
-                                }
-                            } else {
-                                targetButton = btn;
-                                break;
-                            }
-                        }
-                    }
-                    if (targetButton) break;
-                }
-
-                if (!targetButton) {
-                    addLog(`[🤖 ${displayName}] ⚠️ [${maskedPhone}] 未在最新消息中找到匹配 [${rawKws || '任意'}] 的小程序按钮，跳过此步。`);
-                } else {
-                    addLog(`[🤖 ${displayName}] 🚀 [${maskedPhone}] 检测到小程序按钮 [${targetButton.text}]，正在唤出小程序...`);
-                    let lastMsgId = lastBotMsg.id;
-                    let lastText = lastBotMsg.text;
-                    let lastMarkupStr = JSON.stringify(lastBotMsg.replyMarkup);
-                    let miniRes = { success: false, pageText: "" };
-
-                    try {
-                        const themeParams = new Api.DataJSON({
-                            data: JSON.stringify({
-                                bg_color: "#ffffff",
-                                text_color: "#000000",
-                                hint_color: "#707579",
-                                link_color: "#3390ec",
-                                button_color: "#3390ec",
-                                button_text_color: "#ffffff"
-                            })
-                        });
-                        let webViewResult = null;
-                        try {
-                            webViewResult = await client.invoke(new Api.messages.RequestWebView({
-                                peer: botEntity,
-                                bot: botEntity,
-                                platform: "android",
-                                fromBotMenu: false,
-                                url: targetButton.url,
-                                msgId: lastBotMsg.id,
-                                themeParams: themeParams
-                            }));
-                        } catch (err1) {
-                            webViewResult = await client.invoke(new Api.messages.RequestSimpleWebView({
-                                bot: botEntity,
-                                platform: "android",
-                                url: targetButton.url,
-                                themeParams: themeParams
-                            }));
-                        }
-
-                        if (webViewResult && webViewResult.url) {
-                            miniRes = await runMiniAppInHeadlessBrowser(
-                                client,
-                                botEntity,
-                                targetButton,
-                                webViewResult.url,
-                                deviceConf || getDeviceConfig(),
-                                displayName,
-                                maskedPhone || ""
-                            );
-                        }
-                    } catch (webErr) {
-                        addLog(`[🤖 ${displayName}] ⚠️ 唤出小程序异常: ${webErr.message}`);
-                    }
-
-                    let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 10000);
-                    let botMsgText = response ? (response.text || "") : "";
-                    if (!botMsgText) {
-                        let checkMsgs = await client.getMessages(botEntity, { limit: 3 });
-                        let latest = checkMsgs.find(m => !m.out);
-                        if (latest && latest.text) botMsgText = latest.text;
-                    }
-
-                    finalResultText = [miniRes.pageText, botMsgText].filter(Boolean).join(" ");
-                    if (finalResultText) {
-                        addLog(`[🤖 ${displayName}] 📋 [${maskedPhone}] 验证反馈内容: ${finalResultText.replace(/\n/g, ' ').substring(0, 80)}...`);
-                    }
-                }
-            } else {
-                addLog(`[🤖 ${displayName}] ⚠️ 未找到包含按钮的最新消息，无法唤出小程序。`);
             }
         }
         else if (step.type === 'ai_captcha') {
@@ -914,9 +317,6 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                             if (bestAns) {
                                 await randomDelay(1500, 3000);
                                 addLog(`[🤖 ${displayName}] 🎯 AI 选定答案: [${bestAns}]，正在模拟点击...`);
-                                let lastMsgId = lastBotMsg.id;
-                                let lastText = lastBotMsg.text;
-                                let lastMarkupStr = JSON.stringify(lastBotMsg.replyMarkup);
                                 let clickRes = await clickButtonByKeywords(client, botEntity, lastBotMsg, [bestAns], displayName);
                                 
                                 let matchedPopup = false;
@@ -933,6 +333,10 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                                     forceSuccess = true;
                                     break;
                                 } else {
+                                    let lastMsgId = lastBotMsg.id;
+                                    let lastText = lastBotMsg.text;
+                                    let lastMarkupStr = JSON.stringify(lastBotMsg.replyMarkup);
+
                                     let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 25000);
                                     if (response) {
                                         finalResultText = response.text;
@@ -984,84 +388,72 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                 const webViewResult = await client.invoke(new Api.messages.RequestWebView({
                     peer: botEntity,
                     bot: botEntity,
-                    platform: "android",
+                    platform: deviceConf.platform,
                     fromBotMenu: false,
                     url: targetWebAppUrl,
                     themeParams: themeParams
                 }));
                 
                 if (webViewResult && webViewResult.url) {
-                    if (step.type === 'webapp' && (!step.apiUrl || step.apiUrl === 'auto' || step.apiUrl === 'browser')) {
-                        let messagesBefore = await client.getMessages(botEntity, { limit: 5 });
-                        let lastBotMsgBefore = messagesBefore.find(m => !m.out);
-                        let lastMsgId = lastBotMsgBefore ? lastBotMsgBefore.id : 0;
-                        let lastText = lastBotMsgBefore ? lastBotMsgBefore.text : "";
-                        let lastMarkupStr = (lastBotMsgBefore && lastBotMsgBefore.replyMarkup) ? JSON.stringify(lastBotMsgBefore.replyMarkup) : "";
-
-                        await runMiniAppInHeadlessBrowser(client, botEntity, null, webViewResult.url, deviceConf, displayName, maskedPhone);
-                        let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 12000);
-                        if (response) finalResultText = response.text;
-                    } else {
-                        let tgWebAppDataEncoded = "";
-                        let tgWebAppDataDecoded = "";
-                        const match = webViewResult.url.match(/tgWebAppData=([^&]+)/);
+                    let tgWebAppDataEncoded = "";
+                    let tgWebAppDataDecoded = "";
+                    const match = webViewResult.url.match(/tgWebAppData=([^&]+)/);
+                    
+                    if (match && match[1]) {
+                        tgWebAppDataEncoded = match[1];
+                        tgWebAppDataDecoded = decodeURIComponent(match[1]);
                         
-                        if (match && match[1]) {
-                            tgWebAppDataEncoded = match[1];
-                            tgWebAppDataDecoded = decodeURIComponent(match[1]);
-                            
-                            addLog(`[🤖 ${displayName}] ✅ [${maskedPhone}] 成功获取动态鉴权数据!`);
-                            
-                            let fetchOptions = {};
-                            let apiUrl = "";
+                        addLog(`[🤖 ${displayName}] ✅ [${maskedPhone}] 成功获取动态鉴权数据!`);
+                        
+                        let fetchOptions = {};
+                        let apiUrl = "";
 
-                            if (step.type === 'webapp_json') {
-                                const replaceVars = (obj) => {
-                                    if (typeof obj === 'string') {
-                                        return obj.replace(/\{\{tgWebAppData\}\}/g, tgWebAppDataEncoded)
-                                                  .replace(/\{\{tgWebAppData_decoded\}\}/g, tgWebAppDataDecoded);
-                                    } else if (Array.isArray(obj)) {
-                                        return obj.map(replaceVars);
-                                    } else if (typeof obj === 'object' && obj !== null) {
-                                        let res = {};
-                                        for (let k in obj) res[k] = replaceVars(obj[k]);
-                                        return res;
-                                    }
-                                    return obj;
-                                };
-
-                                let finalConfig = replaceVars(step.config);
-                                apiUrl = finalConfig.apiUrl;
-                                const customHeaders = finalConfig.headers || {};
-                                if (!customHeaders['User-Agent'] && !customHeaders['user-agent']) {
-                                    customHeaders['User-Agent'] = deviceConf.userAgent;
+                        if (step.type === 'webapp_json') {
+                            const replaceVars = (obj) => {
+                                if (typeof obj === 'string') {
+                                    return obj.replace(/\{\{tgWebAppData\}\}/g, tgWebAppDataEncoded)
+                                              .replace(/\{\{tgWebAppData_decoded\}\}/g, tgWebAppDataDecoded);
+                                } else if (Array.isArray(obj)) {
+                                    return obj.map(replaceVars);
+                                } else if (typeof obj === 'object' && obj !== null) {
+                                    let res = {};
+                                    for (let k in obj) res[k] = replaceVars(obj[k]);
+                                    return res;
                                 }
-                                fetchOptions = {
-                                    method: finalConfig.method || 'POST',
-                                    headers: customHeaders,
-                                    body: finalConfig.body ? (typeof finalConfig.body === 'string' ? finalConfig.body : JSON.stringify(finalConfig.body)) : undefined
-                                };
-                            } else {
-                                apiUrl = step.apiUrl;
-                                fetchOptions = {
-                                    method: 'POST',
-                                    headers: {
-                                        'Content-Type': 'application/json',
-                                        'Authorization': `Bearer ${tgWebAppDataDecoded}`,
-                                        'User-Agent': deviceConf.userAgent
-                                    },
-                                    body: JSON.stringify({ action: 'checkin', tgWebAppData: tgWebAppDataDecoded })
-                                };
+                                return obj;
+                            };
+
+                            let finalConfig = replaceVars(step.config);
+                            apiUrl = finalConfig.apiUrl;
+                            const customHeaders = finalConfig.headers || {};
+                            if (!customHeaders['User-Agent'] && !customHeaders['user-agent']) {
+                                customHeaders['User-Agent'] = deviceConf.userAgent;
                             }
-                            
-                            await randomDelay(2000, 4000);
-                            const response = await fetch(apiUrl, fetchOptions);
-                            const resText = await response.text();
-                            finalResultText = resText;
-                            addLog(`[🤖 ${displayName}] 🎁 [${maskedPhone}] 小程序返回: ${resText.substring(0, 150)}`);
+                            fetchOptions = {
+                                method: finalConfig.method || 'POST',
+                                headers: customHeaders,
+                                body: finalConfig.body ? (typeof finalConfig.body === 'string' ? finalConfig.body : JSON.stringify(finalConfig.body)) : undefined
+                            };
                         } else {
-                            addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 无法从返回 URL 中提取 tgWebAppData`);
+                            apiUrl = step.apiUrl;
+                            fetchOptions = {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'Authorization': `Bearer ${tgWebAppDataDecoded}`,
+                                    'User-Agent': deviceConf.userAgent
+                                },
+                                body: JSON.stringify({ action: 'checkin', tgWebAppData: tgWebAppDataDecoded })
+                            };
                         }
+                        
+                        await randomDelay(2000, 4000);
+                        const response = await fetch(apiUrl, fetchOptions);
+                        const resText = await response.text();
+                        finalResultText = resText;
+                        addLog(`[🤖 ${displayName}] 🎁 [${maskedPhone}] 小程序返回: ${resText.substring(0, 150)}`);
+                    } else {
+                        addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 无法从返回 URL 中提取 tgWebAppData`);
                     }
                 }
             } catch (e) {
@@ -1184,8 +576,6 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
     addLog(`📱 [${maskedPhone}] 开始执行任务，当前设备环境: ${deviceConf.deviceModel}`);
     const client = new TelegramClient(new StringSession(account.session), apiId, data.settings.apiHash, deviceConf);
     
-    let hasCheckinSuccessOverall = false;
-
     try {
         await client.connect();
         try {
@@ -1242,10 +632,10 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
             }
 
             const lastSuccessBj = state.lastSuccessTime ? getBjDateString(state.lastSuccessTime) : "";
-            let isCheckinSuccess = !isManual && (todayBj === lastSuccessBj);
+            let isCheckinSuccess = (todayBj === lastSuccessBj);
             let skipCheckinSteps = isCheckinSuccess;
 
-            if (!isManual && !skipCheckinSteps && state.todayRetryCount > 0 && botObj.checkKeywords && botObj.checkKeywords.trim() !== "") {
+            if (!skipCheckinSteps && state.todayRetryCount > 0 && botObj.checkKeywords && botObj.checkKeywords.trim() !== "") {
                 try {
                     let preCheckMessages = await client.getMessages(botEntity, { limit: 5 });
                     let lastOutMsg = preCheckMessages.find(m => m.out);
@@ -1278,7 +668,7 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                 }
             }
 
-            if (!isManual && state.todayRetryCount >= 2) {
+            if (state.todayRetryCount >= 2) {
                 addLog(`[🤖 ${displayName}] ⚠️ 今日已达到重试上限(2次)，推迟至明日再次尝试。`);
                 state.nextRunTime = getNextRandomTime(1);
                 data = loadData();
@@ -1292,12 +682,10 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                 continue;
             }
 
-            if (!isManual) {
-                state.todayRetryCount = (state.todayRetryCount || 0) + 1;
-            }
+            state.todayRetryCount = (state.todayRetryCount || 0) + 1;
 
             if (!skipCheckinSteps) {
-                if (state.todayRetryCount <= 1 || isManual) {
+                if (state.todayRetryCount === 1) {
                     addLog(`[🤖 ${displayName}] 🚀 开始执行签到...`);
                 } else {
                     addLog(`[🤖 ${displayName}] 🚀 开始执行签到 重试...`);
@@ -1311,9 +699,7 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
 
             if (!isCheckinSuccess) {
                 state.lastStatus = 'fail';
-                if (isManual) {
-                    addLog(`[🤖 ${displayName}] ❌ 手动签到测试失败。`);
-                } else if (state.todayRetryCount >= 2) {
+                if (state.todayRetryCount >= 2) {
                     state.retryCount = 0;
                     state.nextRunTime = getNextRandomTime(checkinInterval);
                     addLog(`[🤖 ${displayName}] ❌ 今日签到重试已失败，推迟至下次周期。`);
@@ -1327,13 +713,8 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                     addLog(`[🤖 ${displayName}] ❌ 签到失败，已安排重试。`);
                 }
             } else {
-                hasCheckinSuccessOverall = true;
                 state.lastSuccessTime = Date.now();
-                if (!skipCheckinSteps) {
-                    addLog(`[🤖 ${displayName}] ✅ 签到确认成功！`);
-                } else {
-                    addLog(`[🤖 ${displayName}] ℹ️ 今日已签到成功，跳过签到步骤。`);
-                }
+                addLog(`[🤖 ${displayName}] ✅ 签到确认成功！`);
 
                 const renewInterval = parseInt(botObj.renewIntervalDays) || 0;
                 const hasRenewConfig = renewInterval > 0 && Array.isArray(botObj.renewSteps) && botObj.renewSteps.length > 0;
@@ -1365,8 +746,7 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                         state.lastStatus = 'fail';
                         state.lastRenewStatus = 'fail';
                         addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 自动续费失败，准备安排重试...`);
-                        if (isManual) {
-                        } else if (state.todayRetryCount >= 2) {
+                        if (state.todayRetryCount >= 2) {
                             state.retryCount = 0;
                             state.nextRunTime = getNextRandomTime(1);
                             addLog(`[🤖 ${displayName}] ⚠️ 今日续费重试已达上限，推迟至明天再次尝试。`);
@@ -1394,26 +774,13 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
             addLog(`[🤖 ${displayName}] 📅 [${maskedPhone}] 下次执行时间已设定为: ${nextTimeStr}`);
         }
 
-        if (!isManual && hasCheckinSuccessOverall) {
-            await simulateBrowseChannelOrIdle(client, maskedPhone, 300000);
-        }
+        await simulateBrowseChannelOrIdle(client, maskedPhone, 300000);
 
     } catch (error) {
+        addLog(`❌ [${maskedPhone}] 运行出错: ${error.message}`);
         const errStr = String(error.message || error);
-        addLog(`❌ [${maskedPhone}] 运行出错: ${errStr}`);
         data = loadData();
-
-        if (errStr.includes("AUTH_KEY_DUPLICATED")) {
-            addLog(`⚠️ [${maskedPhone}] 检测到该账号 Session 在其他地方或旧进程中仍处于连接状态，已安排 1 分钟后重新尝试。`);
-            const retryTime = Date.now() + 60 * 1000;
-            data.bots.forEach(b => {
-                if (b.states && b.states[accountPhone]) {
-                    b.states[accountPhone].nextRunTime = retryTime;
-                    b.states[accountPhone].lastStatus = 'fail';
-                }
-            });
-            saveData(data);
-        } else if (errStr.includes("AUTH_KEY_UNREGISTERED") || errStr.includes("USER_DEACTIVATED") || errStr.includes("SESSION_REVOKED") || errStr.includes("PHONE_NUMBER_BANNED")) {
+        if (errStr.includes("AUTH_KEY_UNREGISTERED") || errStr.includes("USER_DEACTIVATED") || errStr.includes("SESSION_REVOKED") || errStr.includes("PHONE_NUMBER_BANNED")) {
             addLog(`🚨 [${maskedPhone}] 检测到账号已被封禁或 Session 已失效，已自动推迟该账号所有任务 24 小时。`);
             const longNextTime = Date.now() + 24 * 60 * 60 * 1000;
             data.bots.forEach(b => {
@@ -1434,9 +801,6 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
             saveData(data);
         }
     } finally {
-        try {
-            await client.disconnect();
-        } catch (e) {}
         try {
             await client.destroy();
         } catch (e) {}
@@ -1486,7 +850,7 @@ async function runRenewForAccount(accountPhone, targetBotUsername) {
         const botEntity = await client.getEntity(botObj.username);
         const renewResult = await executeStepList(client, botEntity, botObj.renewSteps, maskedPhone, botObj.name, botObj.checkKeywords, deviceConf, "续费测试");
         
-        const todayBjDate = getBjDateString();
+        const todayBj = getBjDateString();
         data = loadData();
         let bIdx = data.bots.findIndex(b => b.username === botObj.username);
         if (bIdx !== -1) {
@@ -1503,9 +867,9 @@ async function runRenewForAccount(accountPhone, targetBotUsername) {
                 };
             }
             if (renewResult.isSuccess) {
-                data.bots[bIdx].states[accountPhone].lastRenewDate = todayBjDate;
+                data.bots[bIdx].states[accountPhone].lastRenewDate = todayBj;
                 data.bots[bIdx].states[accountPhone].lastRenewStatus = 'success';
-                addLog(`[🤖 ${botObj.name}] 🌟 [${maskedPhone}] 续费测试执行成功，已更新续费日期为: ${todayBjDate}`);
+                addLog(`[🤖 ${botObj.name}] 🌟 [${maskedPhone}] 续费测试执行成功，已更新续费日期为: ${todayBj}`);
             } else {
                 data.bots[bIdx].states[accountPhone].lastRenewStatus = 'fail';
                 addLog(`[🤖 ${botObj.name}] ⚠️ [${maskedPhone}] 续费测试未匹配检测关键词或未确认成功`);
@@ -1515,9 +879,6 @@ async function runRenewForAccount(accountPhone, targetBotUsername) {
     } catch (err) {
         addLog(`[🤖 ${botObj.name}] ❌ [${maskedPhone}] 续费测试失败: ${err.message}`);
     } finally {
-        try {
-            await client.disconnect();
-        } catch (e) {}
         try {
             await client.destroy();
         } catch (e) {}
@@ -1563,12 +924,7 @@ async function importSessionsFromEnv() {
         } catch (error) {
             addLog(`❌ 环境变量 Session 导入失败: ${error.message}`);
         } finally {
-            try {
-                await tempClient.disconnect();
-            } catch (e) {}
-            try {
-                await tempClient.destroy();
-            } catch (e) {}
+            await tempClient.destroy();
         }
     }
     if (addedCount > 0) addLog(`🎉 环境变量导入完成，共新增 ${addedCount} 个账号。`);

@@ -5,7 +5,6 @@ const EventEmitter = require("events");
 const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 
-const utils = require("./utils");
 const {
     addLog,
     getLogs,
@@ -19,8 +18,9 @@ const {
     getNextAvailableDeviceIndex,
     getNextRandomTime,
     defaultSteps,
-    dataEmitter
-} = utils;
+    dataEmitter,
+    initDatabase
+} = require("./utils");
 
 const {
     renderAccountsHtml,
@@ -141,6 +141,7 @@ app.get("/", (req, res) => {
 app.get("/api/events", (req, res) => {
     res.setHeader("Content-Type", "text/event-stream");
     res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
     res.flushHeaders();
 
     const onDataChanged = () => {
@@ -397,7 +398,7 @@ function parseStepsFromText(stepsStr) {
             newSteps.push({ type: 'click', text: line.substring(3).trim() });
         } else if (line.startsWith('Ai识别') || line.startsWith('AI识别')) {
             newSteps.push({ type: 'ai_captcha' });
-        } else if (line.startsWith('小程序:') || line.startsWith('小程序：')) {
+        } else if (line.startsWith('小程序:')) {
             let content = line.substring(4).trim();
             if (content.startsWith('{')) {
                 try {
@@ -406,14 +407,11 @@ function parseStepsFromText(stepsStr) {
                 } catch (e) {
                     addLog(`⚠️ JSON 解析失败，请检查格式: ${e.message}`);
                 }
-            } else if (content.includes('|')) {
+            } else {
                 const parts = content.split('|');
                 if (parts.length >= 2) {
                     newSteps.push({ type: 'webapp', webAppUrl: parts[0].trim(), apiUrl: parts[1].trim() });
                 }
-            } else {
-                const kw = (content === '开启' || content === '') ? "" : content;
-                newSteps.push({ type: 'miniapp_open', text: kw });
             }
         }
     });
@@ -761,13 +759,7 @@ setInterval(async () => {
 }, 60 * 1000);
 
 async function startApp() {
-    if (utils && typeof utils.initDatabase === 'function') {
-        try {
-            await utils.initDatabase();
-        } catch (e) {
-            addLog(`⚠️ 数据库初始化异常: ${e.message}`);
-        }
-    }
+    await initDatabase();
     app.listen(port, async () => {
         addLog(`🚀 控制台服务已启动，监听端口 ${port}`);
         startKeepAlive();

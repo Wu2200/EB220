@@ -2,10 +2,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const EventEmitter = require("events");
-let Pool = null;
-try {
-    Pool = require("pg").Pool;
-} catch (e) {}
+const { Pool } = require("pg");
 
 const dataEmitter = new EventEmitter();
 const dataDir = fs.existsSync("/data") ? "/data" : __dirname;
@@ -235,7 +232,7 @@ function ensureUniqueDeviceIndices(accounts) {
 const dbUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL || "";
 let dbPool = null;
 
-if (dbUrl && Pool) {
+if (dbUrl) {
     dbPool = new Pool({
         connectionString: dbUrl,
         ssl: dbUrl.includes("localhost") ? false : { rejectUnauthorized: false },
@@ -344,6 +341,7 @@ function normalizeData(data) {
 
 async function initDatabase() {
     if (!dbPool) {
+        addLog("ℹ️ 未检测到 DATABASE_URL / POSTGRES_URL 环境变量，使用本地 JSON 文件存储");
         return;
     }
     try {
