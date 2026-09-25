@@ -69,6 +69,7 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
 
         let webAppClosed = false;
         let sentWebViewData = null;
+        let capturedTurnstileToken = null;
 
         await page.exposeFunction("__tgBridgeEvent", async (eventType, eventData) => {
             if (eventType === "web_app_data_send" && eventData) {
@@ -81,6 +82,13 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
             }
             if (eventType === "web_app_close") {
                 webAppClosed = true;
+            }
+        });
+
+        await page.exposeFunction("__cfTokenReady", async (token) => {
+            if (token && typeof token === "string" && token.length > 10) {
+                capturedTurnstileToken = token;
+                addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] Cloudflare Turnstile 验证回调已触发，获取 Token！`);
             }
         });
 
@@ -114,6 +122,12 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                     }
                 }
 
+                try {
+                    delete Navigator.prototype.userAgentData;
+                    delete navigator.userAgentData;
+                    Object.defineProperty(navigator, "userAgentData", { get: () => undefined });
+                } catch (e) {}
+
                 Object.defineProperty(navigator, "webdriver", { get: () => false });
                 Object.defineProperty(navigator, "platform", { get: () => "iPhone" });
                 Object.defineProperty(navigator, "vendor", { get: () => "Apple Computer, Inc." });
@@ -145,6 +159,31 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                     sessionStorage.setItem("__telegram__initParams", JSON.stringify(params));
                 }
             } catch (e) {}
+
+            let _internalTurnstile = window.turnstile;
+            Object.defineProperty(window, "turnstile", {
+                configurable: true,
+                get: () => _internalTurnstile,
+                set: (val) => {
+                    _internalTurnstile = val;
+                    if (val && typeof val.render === "function" && !val._intercepted) {
+                        const origRender = val.render;
+                        val.render = function (container, options) {
+                            if (options && options.callback) {
+                                const origCb = options.callback;
+                                options.callback = function (token) {
+                                    try {
+                                        if (window.__cfTokenReady) window.__cfTokenReady(token);
+                                    } catch (e) {}
+                                    return origCb.apply(this, arguments);
+                                };
+                            }
+                            return origRender.apply(this, arguments);
+                        };
+                        val._intercepted = true;
+                    }
+                }
+            });
 
             const bridgeHandler = function (eventType, eventData) {
                 if (typeof window.__tgBridgeEvent === "function") {
@@ -227,14 +266,37 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
 
         await page.goto(webViewUrl, { waitUntil: "networkidle2", timeout: 30000 }).catch(() => {});
 
-        const startWait = Date.now();
-        let reportedTurnstile = false;
-        let lastReportedText = "";
+        try {
+            await page.evaluate(() => {
+                if (window.Telegram && window.Telegram.WebApp) {
+                    window.Telegram.WebApp.ready();
+                    window.Telegram.WebApp.expand();
+                }
+            });
+        } catch (e) {}
 
-        while (Date.now() - startWait < 45000 && !webAppClosed) {
+        const startWait = Date.now();
+        const clickedKeywords = new Set();
+        let turnstileClickTime = 0;
+        let submittedToken = false;
+        let lastLoggedSummary = "";
+
+        while (Date.now() - startWait < 50000 && !webAppClosed) {
             await sleep(1500);
 
-            const currentText = await page.evaluate(() => document.body ? (document.body.innerText || "") : "").catch(() => "");
+            const pageSummary = await page.evaluate(() => {
+                const text = document.body ? (document.body.innerText || "").replace(/\s+/g, " ").trim() : "";
+                const hasIframe = Boolean(document.querySelector("iframe"));
+                const hasTurnstileInput = Boolean(document.querySelector('input[name="cf-turnstile-response"]'));
+                return { text, hasIframe, hasTurnstileInput };
+            }).catch(() => ({ text: "", hasIframe: false, hasTurnstileInput: false }));
+
+            const currentText = pageSummary.text;
+
+            if (currentText && currentText !== lastLoggedSummary && !currentText.includes(lastLoggedSummary)) {
+                lastLoggedSummary = currentText.substring(0, 60);
+                addLog(`[🤖 ${botName}] 📄 [${maskedPhone}] 页面内容: ${lastLoggedSummary}...`);
+            }
 
             if (currentText.includes("加载超时") || currentText.includes("重新加载") || currentText.includes("网络错误")) {
                 await page.evaluate(() => {
@@ -249,47 +311,63 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 }).catch(() => {});
             }
 
-            const clickedBtn = await page.evaluate(() => {
-                const keywords = ["人机验证", "开始验证", "点击验证", "立即验证", "进行验证", "完成验证", "点击完成验证", "立即签到", "确认", "确定", "Submit", "Verify"];
-                const elements = Array.from(document.querySelectorAll("button, a, div[role='button'], input[type='submit'], .btn, .card, div, span"));
-                for (const el of elements) {
-                    const txt = (el.innerText || el.textContent || el.value || "").trim();
-                    if (txt && keywords.some(k => txt === k || (txt.length < 15 && txt.includes(k)))) {
-                        if (el.children.length <= 1 || el.tagName === "BUTTON" || el.tagName === "A" || el.getAttribute("role") === "button") {
-                            el.click();
-                            return txt;
+            const candidateKeywords = [
+                "人机验证", "开始验证", "点击验证", "立即验证", "进行验证",
+                "完成验证", "点击完成验证", "确认", "确定"
+            ];
+
+            for (const kw of candidateKeywords) {
+                if (clickedKeywords.has(kw)) continue;
+
+                const clickedThis = await page.evaluate((targetKw) => {
+                    const allEls = Array.from(document.querySelectorAll("button, a, div[role='button'], input[type='submit'], .btn, .card, div, span"));
+                    for (const el of allEls) {
+                        const txt = (el.innerText || el.textContent || el.value || "").trim();
+                        if (txt === targetKw || (txt.length <= 12 && txt.includes(targetKw))) {
+                            if (el.tagName === "BUTTON" || el.tagName === "A" || el.getAttribute("role") === "button" || el.classList.contains("btn") || el.classList.contains("card") || el.children.length === 0) {
+                                el.click();
+                                return txt;
+                            }
                         }
                     }
-                }
-                return null;
-            }).catch(() => null);
+                    return null;
+                }, kw).catch(() => null);
 
-            if (clickedBtn && clickedBtn !== lastReportedText) {
-                lastReportedText = clickedBtn;
-                addLog(`[🤖 ${botName}] 👉 [${maskedPhone}] 点击了操作按钮: [${clickedBtn}]`);
+                if (clickedThis) {
+                    clickedKeywords.add(kw);
+                    addLog(`[🤖 ${botName}] 👉 [${maskedPhone}] 点击了操作项: [${clickedThis}]`);
+                    await sleep(2000);
+                    break;
+                }
             }
 
-            try {
-                const iframes = await page.$$("iframe");
-                for (const ifr of iframes) {
-                    const box = await ifr.boundingBox();
-                    if (box && box.width > 20 && box.height > 20) {
-                        const src = await ifr.evaluate(el => el.src || '').catch(() => '');
-                        const isCf = src.includes("challenges.cloudflare.com") || src.includes("turnstile") || src.includes("cf-chl") || src === "" || src.includes("about:blank");
-                        if (isCf) {
-                            const clickX = box.x + Math.min(32, Math.max(16, box.width * 0.15));
-                            const clickY = box.y + box.height / 2;
-                            await page.mouse.move(box.x + 5, box.y + 5);
-                            await sleep(50);
-                            await page.mouse.move(clickX, clickY, { steps: 3 });
-                            await sleep(50);
-                            await page.mouse.down();
-                            await sleep(80);
-                            await page.mouse.up();
+            const now = Date.now();
+            if (now - turnstileClickTime > 8000) {
+                try {
+                    const iframes = await page.$$("iframe");
+                    for (const ifr of iframes) {
+                        const box = await ifr.boundingBox();
+                        if (box && box.width > 20 && box.height > 20) {
+                            const src = await ifr.evaluate(el => el.src || "").catch(() => "");
+                            const isCf = src.includes("challenges.cloudflare.com") || src.includes("turnstile") || src.includes("cf-chl") || src === "" || src.includes("about:blank");
+                            if (isCf) {
+                                turnstileClickTime = Date.now();
+                                addLog(`[🤖 ${botName}] 👆 [${maskedPhone}] 检测到 Cloudflare 验证框，正在模拟点击复选框...`);
+                                const clickX = box.x + Math.min(32, Math.max(16, box.width * 0.15));
+                                const clickY = box.y + box.height / 2;
+                                await page.mouse.move(box.x + 2, box.y + 2);
+                                await sleep(60);
+                                await page.mouse.move(clickX, clickY, { steps: 5 });
+                                await sleep(60);
+                                await page.mouse.down();
+                                await sleep(90);
+                                await page.mouse.up();
+                                break;
+                            }
                         }
                     }
-                }
-            } catch (e) {}
+                } catch (e) {}
+            }
 
             try {
                 const frames = page.frames();
@@ -307,38 +385,32 @@ async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, dev
                 }
             } catch (e) {}
 
-            try {
-                await page.evaluate(() => {
-                    const geetestBtn = document.querySelector(".geetest_radar_tip") ||
-                                       document.querySelector(".geetest_btn") ||
-                                       document.querySelector(".geetest_radar_btn") ||
-                                       document.querySelector(".geetest_holder");
-                    if (geetestBtn) geetestBtn.click();
-                }).catch(() => {});
-            } catch (e) {}
+            let currentToken = capturedTurnstileToken;
+            if (!currentToken) {
+                currentToken = await page.evaluate(() => {
+                    const cfInput = document.querySelector('input[name="cf-turnstile-response"]') || document.querySelector('textarea[name="cf-turnstile-response"]');
+                    if (cfInput && cfInput.value && cfInput.value.length > 10) return cfInput.value;
+                    if (window.turnstile && typeof window.turnstile.getResponse === "function") {
+                        const t = window.turnstile.getResponse();
+                        if (t && t.length > 10) return t;
+                    }
+                    return null;
+                }).catch(() => null);
+            }
 
-            const turnstileToken = await page.evaluate(() => {
-                const cfInput = document.querySelector('input[name="cf-turnstile-response"]');
-                if (cfInput && cfInput.value && cfInput.value.length > 10) return cfInput.value;
-                if (window.turnstile && typeof window.turnstile.getResponse === 'function') {
-                    const t = window.turnstile.getResponse();
-                    if (t && t.length > 10) return t;
-                }
-                return null;
-            }).catch(() => null);
-
-            if (turnstileToken && !reportedTurnstile) {
-                reportedTurnstile = true;
-                addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] 已成功获取 Cloudflare 验证 Token！`);
-                await page.evaluate(() => {
+            if (currentToken && !submittedToken) {
+                submittedToken = true;
+                addLog(`[🤖 ${botName}] 🎯 [${maskedPhone}] 已成功获取 Cloudflare 验证 Token: ${currentToken.substring(0, 16)}...`);
+                await page.evaluate((tok) => {
                     const submits = Array.from(document.querySelectorAll("button, a, div[role='button'], input[type='submit'], .btn"));
                     for (const b of submits) {
                         const t = (b.innerText || b.textContent || b.value || "").trim();
-                        if (t.includes("验证") || t.includes("提交") || t.includes("签到") || t.includes("确定") || t.includes("Submit")) {
+                        if (t.includes("签到") || t.includes("提交") || t.includes("完成") || t.includes("确定") || t.includes("Submit")) {
                             b.click();
+                            break;
                         }
                     }
-                }).catch(() => {});
+                }, currentToken).catch(() => {});
             }
 
             if (currentText.includes("验证成功") || currentText.includes("签到成功") || currentText.includes("Verification successful") || currentText.includes("Success")) {
