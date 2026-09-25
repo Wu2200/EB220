@@ -1,3 +1,5 @@
+const fs = require("fs");
+const puppeteer = require("puppeteer-core");
 const { TelegramClient, Api } = require("telegram");
 const { StringSession } = require("telegram/sessions");
 const {
@@ -21,6 +23,133 @@ const runningAccounts = new Set();
 function randomDelay(minMs, maxMs) {
     const ms = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
     return sleep(ms);
+}
+
+function getChromiumPath() {
+    const candidates = [
+        process.env.PUPPETEER_EXECUTABLE_PATH,
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome"
+    ].filter(Boolean);
+    for (const p of candidates) {
+        if (fs.existsSync(p)) return p;
+    }
+    return "/usr/bin/chromium-browser";
+}
+
+async function runMiniAppInHeadlessBrowser(client, peer, button, webViewUrl, deviceConf, botName, maskedPhone) {
+    let browser = null;
+    try {
+        const executablePath = getChromiumPath();
+        addLog(`[🤖 ${botName}] 🌐 [${maskedPhone}] 正在启动内置浏览器加载小程序并执行自动验证...`);
+        browser = await puppeteer.launch({
+            executablePath,
+            headless: "new",
+            args: [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-accelerated-2d-canvas",
+                "--no-first-run",
+                "--no-zygote",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled"
+            ]
+        });
+
+        const page = await browser.newPage();
+        await page.setViewport({ width: 390, height: 844, isMobile: true, hasTouch: true });
+        await page.setUserAgent(deviceConf.userAgent);
+
+        let webAppClosed = false;
+        let sentWebViewData = null;
+
+        await page.exposeFunction("__tgBridgeEvent", async (eventType, eventData) => {
+            if (eventType === "web_app_data_send" && eventData) {
+                try {
+                    const parsed = typeof eventData === "string" ? JSON.parse(eventData) : eventData;
+                    if (parsed && parsed.data) {
+                        sentWebViewData = String(parsed.data);
+                    }
+                } catch (e) {}
+            }
+            if (eventType === "web_app_close") {
+                webAppClosed = true;
+            }
+        });
+
+        await page.evaluateOnNewDocument(() => {
+            Object.defineProperty(navigator, "webdriver", { get: () => false });
+            window.TelegramWebviewProxy = {
+                postEvent: function (eventType, eventData) {
+                    if (typeof window.__tgBridgeEvent === "function") {
+                        window.__tgBridgeEvent(eventType, eventData);
+                    }
+                }
+            };
+        });
+
+        await page.goto(webViewUrl, { waitUntil: "domcontentloaded", timeout: 25000 }).catch(() => {});
+
+        const startWait = Date.now();
+        while (Date.now() - startWait < 18000 && !webAppClosed) {
+            await sleep(2000);
+
+            try {
+                const frames = page.frames();
+                for (const frame of frames) {
+                    const frameUrl = frame.url();
+                    if (frameUrl.includes("challenges.cloudflare.com") || frameUrl.includes("turnstile")) {
+                        const box = await frame.evaluate(() => {
+                            const el = document.querySelector("input[type='checkbox']") || document.body;
+                            if (!el) return null;
+                            const rect = el.getBoundingClientRect();
+                            return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+                        }).catch(() => null);
+                        if (box) {
+                            await frame.click("body").catch(() => {});
+                        }
+                    }
+                }
+
+                await page.evaluate(() => {
+                    const keywords = ["签到", "簽到", "验证", "驗證", "确认", "確認", "立即签到", "Verify", "Check"];
+                    const buttons = Array.from(document.querySelectorAll("button, a, div[role='button'], .btn"));
+                    for (const btn of buttons) {
+                        const txt = (btn.innerText || btn.textContent || "").trim();
+                        if (txt && keywords.some(k => txt.includes(k))) {
+                            btn.click();
+                        }
+                    }
+                }).catch(() => {});
+            } catch (e) {}
+
+            if (sentWebViewData && button) {
+                try {
+                    await client.invoke(new Api.messages.SendWebViewData({
+                        bot: peer,
+                        randomId: BigInt(Math.floor(Math.random() * 1e15)),
+                        buttonText: button.text || "签到",
+                        data: sentWebViewData
+                    }));
+                    addLog(`[🤖 ${botName}] 📤 [${maskedPhone}] 已向机器人回传小程序验证数据`);
+                    break;
+                } catch (e) {}
+            }
+        }
+
+        addLog(`[🤖 ${botName}] ✅ [${maskedPhone}] 小程序运行与验证流程执行完毕`);
+    } catch (err) {
+        addLog(`[🤖 ${botName}] ⚠️ [${maskedPhone}] 浏览器运行小程序异常: ${err.message}`);
+    } finally {
+        if (browser) {
+            try {
+                await browser.close();
+            } catch (e) {}
+        }
+    }
 }
 
 async function callModel(endpoint, key, model, base64Image, options, timeoutMs) {
@@ -126,7 +255,7 @@ async function getBestAnswer(base64Image, options, aiSettings, botName) {
     return bestAns;
 }
 
-async function clickButtonByKeywords(client, peer, message, keywords, botName) {
+async function clickButtonByKeywords(client, peer, message, keywords, botName, deviceConf, maskedPhone) {
     if (!message.replyMarkup || !message.replyMarkup.rows) return { clicked: false, popupText: "" };
     
     for (const row of message.replyMarkup.rows) {
@@ -134,6 +263,64 @@ async function clickButtonByKeywords(client, peer, message, keywords, botName) {
             if (button.text) {
                 for (const kw of keywords) {
                     if (button.text.includes(kw)) {
+                        const isWebViewBtn = Boolean(
+                            button.url && (
+                                button.className === "KeyboardButtonWebView" ||
+                                button.className === "KeyboardButtonSimpleWebView" ||
+                                !button.data
+                            )
+                        );
+
+                        if (isWebViewBtn) {
+                            addLog(`[🤖 ${botName}] 👉 匹配到小程序按钮: [${button.text}]，正在唤出小程序...`);
+                            try {
+                                const themeParams = new Api.DataJSON({
+                                    data: JSON.stringify({
+                                        bg_color: "#ffffff",
+                                        text_color: "#000000",
+                                        hint_color: "#707579",
+                                        link_color: "#3390ec",
+                                        button_color: "#3390ec",
+                                        button_text_color: "#ffffff"
+                                    })
+                                });
+                                let webViewResult = null;
+                                try {
+                                    webViewResult = await client.invoke(new Api.messages.RequestWebView({
+                                        peer: peer,
+                                        bot: peer,
+                                        platform: (deviceConf && deviceConf.platform) || "ios",
+                                        fromBotMenu: false,
+                                        url: button.url,
+                                        msgId: message.id,
+                                        themeParams: themeParams
+                                    }));
+                                } catch (err1) {
+                                    webViewResult = await client.invoke(new Api.messages.RequestSimpleWebView({
+                                        bot: peer,
+                                        platform: (deviceConf && deviceConf.platform) || "ios",
+                                        url: button.url,
+                                        themeParams: themeParams
+                                    }));
+                                }
+
+                                if (webViewResult && webViewResult.url) {
+                                    await runMiniAppInHeadlessBrowser(
+                                        client,
+                                        peer,
+                                        button,
+                                        webViewResult.url,
+                                        deviceConf || getDeviceConfig(),
+                                        botName,
+                                        maskedPhone || ""
+                                    );
+                                }
+                            } catch (webErr) {
+                                addLog(`[🤖 ${botName}] ⚠️ 唤出小程序异常: ${webErr.message}`);
+                            }
+                            return { clicked: true, popupText: "" };
+                        }
+
                         addLog(`[🤖 ${botName}] 👉 匹配到按钮: [${button.text}]，正在模拟点击...`);
                         let popupText = "";
                         
@@ -252,8 +439,12 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
 
             if (lastBotMsg) {
                 latestHandledMsgId = Math.max(latestHandledMsgId, lastBotMsg.id);
+                let lastMsgId = lastBotMsg.id;
+                let lastText = lastBotMsg.text;
+                let lastMarkupStr = lastBotMsg.replyMarkup ? JSON.stringify(lastBotMsg.replyMarkup) : "";
+
                 let keywords = step.text.split(',').map(k => k.trim()).filter(k => k);
-                let clickRes = await clickButtonByKeywords(client, botEntity, lastBotMsg, keywords, displayName);
+                let clickRes = await clickButtonByKeywords(client, botEntity, lastBotMsg, keywords, displayName, deviceConf, maskedPhone);
                 
                 if (!clickRes.clicked) {
                     addLog(`[🤖 ${displayName}] ℹ️ [${maskedPhone}] 未找到匹配的按钮 [${step.text}]，跳过此步。`);
@@ -272,10 +463,6 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                         forceSuccess = true;
                         break;
                     } else {
-                        let lastMsgId = lastBotMsg.id;
-                        let lastText = lastBotMsg.text;
-                        let lastMarkupStr = lastBotMsg.replyMarkup ? JSON.stringify(lastBotMsg.replyMarkup) : "";
-
                         let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 12000);
                         if (response) {
                             finalResultText = response.text;
@@ -317,7 +504,10 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                             if (bestAns) {
                                 await randomDelay(1500, 3000);
                                 addLog(`[🤖 ${displayName}] 🎯 AI 选定答案: [${bestAns}]，正在模拟点击...`);
-                                let clickRes = await clickButtonByKeywords(client, botEntity, lastBotMsg, [bestAns], displayName);
+                                let lastMsgId = lastBotMsg.id;
+                                let lastText = lastBotMsg.text;
+                                let lastMarkupStr = JSON.stringify(lastBotMsg.replyMarkup);
+                                let clickRes = await clickButtonByKeywords(client, botEntity, lastBotMsg, [bestAns], displayName, deviceConf, maskedPhone);
                                 
                                 let matchedPopup = false;
                                 if (clickRes.popupText && checkKeywords && checkKeywords.trim() !== "") {
@@ -333,10 +523,6 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                                     forceSuccess = true;
                                     break;
                                 } else {
-                                    let lastMsgId = lastBotMsg.id;
-                                    let lastText = lastBotMsg.text;
-                                    let lastMarkupStr = JSON.stringify(lastBotMsg.replyMarkup);
-
                                     let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 25000);
                                     if (response) {
                                         finalResultText = response.text;
@@ -395,65 +581,77 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
                 }));
                 
                 if (webViewResult && webViewResult.url) {
-                    let tgWebAppDataEncoded = "";
-                    let tgWebAppDataDecoded = "";
-                    const match = webViewResult.url.match(/tgWebAppData=([^&]+)/);
-                    
-                    if (match && match[1]) {
-                        tgWebAppDataEncoded = match[1];
-                        tgWebAppDataDecoded = decodeURIComponent(match[1]);
-                        
-                        addLog(`[🤖 ${displayName}] ✅ [${maskedPhone}] 成功获取动态鉴权数据!`);
-                        
-                        let fetchOptions = {};
-                        let apiUrl = "";
+                    if (step.type === 'webapp' && (!step.apiUrl || step.apiUrl === 'auto' || step.apiUrl === 'browser')) {
+                        let messagesBefore = await client.getMessages(botEntity, { limit: 5 });
+                        let lastBotMsgBefore = messagesBefore.find(m => !m.out);
+                        let lastMsgId = lastBotMsgBefore ? lastBotMsgBefore.id : 0;
+                        let lastText = lastBotMsgBefore ? lastBotMsgBefore.text : "";
+                        let lastMarkupStr = (lastBotMsgBefore && lastBotMsgBefore.replyMarkup) ? JSON.stringify(lastBotMsgBefore.replyMarkup) : "";
 
-                        if (step.type === 'webapp_json') {
-                            const replaceVars = (obj) => {
-                                if (typeof obj === 'string') {
-                                    return obj.replace(/\{\{tgWebAppData\}\}/g, tgWebAppDataEncoded)
-                                              .replace(/\{\{tgWebAppData_decoded\}\}/g, tgWebAppDataDecoded);
-                                } else if (Array.isArray(obj)) {
-                                    return obj.map(replaceVars);
-                                } else if (typeof obj === 'object' && obj !== null) {
-                                    let res = {};
-                                    for (let k in obj) res[k] = replaceVars(obj[k]);
-                                    return res;
-                                }
-                                return obj;
-                            };
-
-                            let finalConfig = replaceVars(step.config);
-                            apiUrl = finalConfig.apiUrl;
-                            const customHeaders = finalConfig.headers || {};
-                            if (!customHeaders['User-Agent'] && !customHeaders['user-agent']) {
-                                customHeaders['User-Agent'] = deviceConf.userAgent;
-                            }
-                            fetchOptions = {
-                                method: finalConfig.method || 'POST',
-                                headers: customHeaders,
-                                body: finalConfig.body ? (typeof finalConfig.body === 'string' ? finalConfig.body : JSON.stringify(finalConfig.body)) : undefined
-                            };
-                        } else {
-                            apiUrl = step.apiUrl;
-                            fetchOptions = {
-                                method: 'POST',
-                                headers: {
-                                    'Content-Type': 'application/json',
-                                    'Authorization': `Bearer ${tgWebAppDataDecoded}`,
-                                    'User-Agent': deviceConf.userAgent
-                                },
-                                body: JSON.stringify({ action: 'checkin', tgWebAppData: tgWebAppDataDecoded })
-                            };
-                        }
-                        
-                        await randomDelay(2000, 4000);
-                        const response = await fetch(apiUrl, fetchOptions);
-                        const resText = await response.text();
-                        finalResultText = resText;
-                        addLog(`[🤖 ${displayName}] 🎁 [${maskedPhone}] 小程序返回: ${resText.substring(0, 150)}`);
+                        await runMiniAppInHeadlessBrowser(client, botEntity, null, webViewResult.url, deviceConf, displayName, maskedPhone);
+                        let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 12000);
+                        if (response) finalResultText = response.text;
                     } else {
-                        addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 无法从返回 URL 中提取 tgWebAppData`);
+                        let tgWebAppDataEncoded = "";
+                        let tgWebAppDataDecoded = "";
+                        const match = webViewResult.url.match(/tgWebAppData=([^&]+)/);
+                        
+                        if (match && match[1]) {
+                            tgWebAppDataEncoded = match[1];
+                            tgWebAppDataDecoded = decodeURIComponent(match[1]);
+                            
+                            addLog(`[🤖 ${displayName}] ✅ [${maskedPhone}] 成功获取动态鉴权数据!`);
+                            
+                            let fetchOptions = {};
+                            let apiUrl = "";
+
+                            if (step.type === 'webapp_json') {
+                                const replaceVars = (obj) => {
+                                    if (typeof obj === 'string') {
+                                        return obj.replace(/\{\{tgWebAppData\}\}/g, tgWebAppDataEncoded)
+                                                  .replace(/\{\{tgWebAppData_decoded\}\}/g, tgWebAppDataDecoded);
+                                    } else if (Array.isArray(obj)) {
+                                        return obj.map(replaceVars);
+                                    } else if (typeof obj === 'object' && obj !== null) {
+                                        let res = {};
+                                        for (let k in obj) res[k] = replaceVars(obj[k]);
+                                        return res;
+                                    }
+                                    return obj;
+                                };
+
+                                let finalConfig = replaceVars(step.config);
+                                apiUrl = finalConfig.apiUrl;
+                                const customHeaders = finalConfig.headers || {};
+                                if (!customHeaders['User-Agent'] && !customHeaders['user-agent']) {
+                                    customHeaders['User-Agent'] = deviceConf.userAgent;
+                                }
+                                fetchOptions = {
+                                    method: finalConfig.method || 'POST',
+                                    headers: customHeaders,
+                                    body: finalConfig.body ? (typeof finalConfig.body === 'string' ? finalConfig.body : JSON.stringify(finalConfig.body)) : undefined
+                                };
+                            } else {
+                                apiUrl = step.apiUrl;
+                                fetchOptions = {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json',
+                                        'Authorization': `Bearer ${tgWebAppDataDecoded}`,
+                                        'User-Agent': deviceConf.userAgent
+                                    },
+                                    body: JSON.stringify({ action: 'checkin', tgWebAppData: tgWebAppDataDecoded })
+                                };
+                            }
+                            
+                            await randomDelay(2000, 4000);
+                            const response = await fetch(apiUrl, fetchOptions);
+                            const resText = await response.text();
+                            finalResultText = resText;
+                            addLog(`[🤖 ${displayName}] 🎁 [${maskedPhone}] 小程序返回: ${resText.substring(0, 150)}`);
+                        } else {
+                            addLog(`[🤖 ${displayName}] ❌ [${maskedPhone}] 无法从返回 URL 中提取 tgWebAppData`);
+                        }
                     }
                 }
             } catch (e) {

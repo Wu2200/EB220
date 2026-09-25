@@ -1,5 +1,17 @@
 FROM node:18-alpine
 
+# 安装 Chromium 浏览器及字体依赖，用于自动唤起并运行 Telegram 小程序与 CF 验证
+RUN apk add --no-cache \
+    chromium \
+    nss \
+    freetype \
+    harfbuzz \
+    ca-certificates \
+    ttf-freefont
+
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+
 WORKDIR /app
 
 # 复制依赖文件并安装
