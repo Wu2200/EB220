@@ -23,86 +23,49 @@ function randomDelay(minMs, maxMs) {
     return sleep(ms);
 }
 
-async function callModel(endpoint, key, model, base64Image, options, timeoutMs, botName = "AI") {
+async function callModel(endpoint, key, model, base64Image, options, timeoutMs) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-    let fullAnswer = "";
-    let isContinued = false;
-    let round = 1;
-    const maxRounds = 3;
-
-    const messages = [
-        {
-            role: "user",
-            content: [
-                {
-                    type: "text",
-                    text: `这是一张验证图片。请从以下选项中选择一个最符合图片内容的选项。你必须只输出选项中的原文，不要包含任何其他文字、标点符号或解释。\n选项列表：${options.join(', ')}`
-                },
-                {
-                    type: "image_url",
-                    image_url: {
-                        url: `data:image/jpeg;base64,${base64Image}`
-                    }
-                }
-            ]
-        }
-    ];
-
     try {
-        while (round <= maxRounds) {
-            if (isContinued) {
-                addLog(`[🤖 ${botName}] 🔄 模型 [${model}] 触发第 ${round} 次 [续写请求]，正在续接生成...`);
-            }
-
-            const response = await fetch(`${endpoint.replace(/\/$/, '')}/chat/completions`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'Authorization': `Bearer ${key}`,
-                    'X-Is-Continuation': isContinued ? 'true' : 'false',
-                    'X-Continuation-Round': String(round)
-                },
-                body: JSON.stringify({
-                    model: model,
-                    messages: messages,
-                    max_tokens: 50
-                }),
-                signal: controller.signal
-            });
-
-            if (!response.ok) {
-                const errText = await response.text();
-                throw new Error(`HTTP ${response.status}: ${errText}`);
-            }
-
-            const resData = await response.json();
-            const choice = resData.choices && resData.choices[0];
-            if (!choice || !choice.message) {
-                throw new Error("接口未返回有效 choices 数据");
-            }
-
-            const currentText = choice.message.content ? choice.message.content.trim() : "";
-            fullAnswer += currentText;
-            const finishReason = choice.finish_reason;
-
-            if (finishReason === "length") {
-                addLog(`[🤖 ${botName}] ⚠️ 模型 [${model}] 本轮输出达到长度上限被截断 (finish_reason: length)，准备续写...`);
-                isContinued = true;
-                round++;
-                messages.push({ role: "assistant", content: currentText });
-                messages.push({ role: "user", content: "请紧接着上一句未说完的内容继续输出，不要重复前文。" });
-            } else {
-                if (isContinued) {
-                    addLog(`[🤖 ${botName}] 🎯 模型 [${model}] [续写完成] (finish_reason: ${finishReason})`);
-                }
-                break;
-            }
-        }
-
+        const response = await fetch(`${endpoint.replace(/\/$/, '')}/chat/completions`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${key}`
+            },
+            body: JSON.stringify({
+                model: model,
+                messages: [
+                    {
+                        role: "user",
+                        content: [
+                            {
+                                type: "text",
+                                text: `这是一张验证图片。请从以下选项中选择一个最符合图片内容的选项。你必须只输出选项中的原文，不要包含任何其他文字、标点符号或解释。\n选项列表：${options.join(', ')}`
+                            },
+                            {
+                                type: "image_url",
+                                image_url: {
+                                    url: `data:image/jpeg;base64,${base64Image}`
+                                }
+                            }
+                        ]
+                    }
+                ],
+                max_tokens: 50
+            }),
+            signal: controller.signal
+        });
         clearTimeout(timeoutId);
-        return fullAnswer.trim();
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`HTTP ${response.status}: ${errText}`);
+        }
+        const resData = await response.json();
+        if (resData.choices && resData.choices[0] && resData.choices[0].message) {
+            return resData.choices[0].message.content.trim();
+        }
+        throw new Error("接口未返回有效 choices 数据");
     } catch (e) {
         clearTimeout(timeoutId);
         throw e;
@@ -124,7 +87,7 @@ async function getBestAnswer(base64Image, options, aiSettings, botName) {
     addLog(`[🤖 ${botName}] 🚀 正在向模型 [${models.join(', ')}] 发送并发请求...`);
 
     const promises = models.map(model => 
-        callModel(aiEndpoint, aiKey, model, base64Image, options, 22000, botName)
+        callModel(aiEndpoint, aiKey, model, base64Image, options, 22000)
         .then(ans => ({ model, ans, success: true }))
         .catch(err => ({ model, err: err.message, success: false }))
     );
@@ -653,7 +616,7 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                     state.nextRunTime = getNextRandomTime(checkinInterval);
                 } else {
                     state.retryCount = 0;
-                    state.nextRunTime = getNextRandomTime(checkinInterval);
+                    state.nextRunTime = getRetryTime();
                 }
                 
                 data = loadData();
@@ -811,11 +774,7 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
             addLog(`[🤖 ${displayName}] 📅 [${maskedPhone}] 下次执行时间已设定为: ${nextTimeStr}`);
         }
 
-        if (isManual) {
-            // 手动执行完成立即退出
-        } else {
-            await simulateBrowseChannelOrIdle(client, maskedPhone, 300000);
-        }
+        await simulateBrowseChannelOrIdle(client, maskedPhone, 300000);
 
     } catch (error) {
         addLog(`❌ [${maskedPhone}] 运行出错: ${error.message}`);
@@ -842,9 +801,6 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
             saveData(data);
         }
     } finally {
-        try {
-            await client.disconnect();
-        } catch (e) {}
         try {
             await client.destroy();
         } catch (e) {}
@@ -924,9 +880,6 @@ async function runRenewForAccount(accountPhone, targetBotUsername) {
         addLog(`[🤖 ${botObj.name}] ❌ [${maskedPhone}] 续费测试失败: ${err.message}`);
     } finally {
         try {
-            await client.disconnect();
-        } catch (e) {}
-        try {
             await client.destroy();
         } catch (e) {}
         runningAccounts.delete(accountPhone);
@@ -971,12 +924,7 @@ async function importSessionsFromEnv() {
         } catch (error) {
             addLog(`❌ 环境变量 Session 导入失败: ${error.message}`);
         } finally {
-            try {
-                await tempClient.disconnect();
-            } catch (e) {}
-            try {
-                await tempClient.destroy();
-            } catch (e) {}
+            await tempClient.destroy();
         }
     }
     if (addedCount > 0) addLog(`🎉 环境变量导入完成，共新增 ${addedCount} 个账号。`);
