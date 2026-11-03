@@ -23,10 +23,84 @@ function randomDelay(minMs, maxMs) {
     return sleep(ms);
 }
 
-async function callModel(endpoint, key, model, base64Image, options, timeoutMs) {
+function solveMathExpression(text, options) {
+    if (!text || !options || options.length === 0) return null;
+    
+    const normalized = text
+        .replace(/＋/g, '+')
+        .replace(/[－—–]/g, '-')
+        .replace(/[×✕✖]/g, '*')
+        .replace(/[÷]/g, '/')
+        .replace(/＝/g, '=')
+        .replace(/？/g, '?');
+
+    const pattern1 = /(\d+)\s*([\+\-\*\/])\s*(\d+)(?:\s*=\s*(?:\?|\b)?)?/;
+    const pattern2 = /(\d+)\s*(加|减|乘|除)\s*(\d+)(?:\s*(?:等于|是)\s*(?:几|\?)?)?/;
+
+    let num1, op, num2;
+    const m1 = normalized.match(pattern1);
+    const m2 = normalized.match(pattern2);
+
+    if (m1) {
+        num1 = parseInt(m1[1], 10);
+        op = m1[2];
+        num2 = parseInt(m1[3], 10);
+    } else if (m2) {
+        num1 = parseInt(m2[1], 10);
+        const opMap = { '加': '+', '减': '-', '乘': '*', '除': '/' };
+        op = opMap[m2[2]];
+        num2 = parseInt(m2[3], 10);
+    }
+
+    if (num1 !== undefined && op && num2 !== undefined) {
+        let result = null;
+        if (op === '+') result = num1 + num2;
+        else if (op === '-') result = num1 - num2;
+        else if (op === '*') result = num1 * num2;
+        else if (op === '/') result = num2 !== 0 ? Math.floor(num1 / num2) : null;
+
+        if (result !== null) {
+            const resStr = String(result);
+            const matchedOpt = options.find(opt => {
+                const clean = opt.trim().replace(/['"“”\s]/g, '');
+                return clean === resStr || clean === `=${resStr}` || clean === `${resStr}号`;
+            });
+            if (matchedOpt) {
+                return { answer: matchedOpt, detail: `${num1} ${op} ${num2} = ${result}` };
+            }
+        }
+    }
+
+    return null;
+}
+
+async function callModel(endpoint, key, model, base64Image, questionText, options, timeoutMs) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
     try {
+        let contentArr;
+        if (base64Image) {
+            contentArr = [
+                {
+                    type: "text",
+                    text: `${questionText ? `题目描述/消息内容：\n${questionText}\n\n` : ''}这是一张验证图片。请从以下选项中选择一个最符合图片内容或题目要求的选项。你必须只输出选项中的原文，不要包含任何其他文字、标点符号或解释。\n选项列表：${options.join(', ')}`
+                },
+                {
+                    type: "image_url",
+                    image_url: {
+                        url: `data:image/jpeg;base64,${base64Image}`
+                    }
+                }
+            ];
+        } else {
+            contentArr = [
+                {
+                    type: "text",
+                    text: `这是一道验证题目：\n${questionText}\n\n请从以下选项中选择一个最符合题目要求的正确答案。你必须只输出选项中的原文，不要包含任何其他文字、标点符号或解释。\n选项列表：${options.join(', ')}`
+                }
+            ];
+        }
+
         const response = await fetch(`${endpoint.replace(/\/$/, '')}/chat/completions`, {
             method: 'POST',
             headers: {
@@ -38,18 +112,7 @@ async function callModel(endpoint, key, model, base64Image, options, timeoutMs) 
                 messages: [
                     {
                         role: "user",
-                        content: [
-                            {
-                                type: "text",
-                                text: `这是一张验证图片。请从以下选项中选择一个最符合图片内容的选项。你必须只输出选项中的原文，不要包含任何其他文字、标点符号或解释。\n选项列表：${options.join(', ')}`
-                            },
-                            {
-                                type: "image_url",
-                                image_url: {
-                                    url: `data:image/jpeg;base64,${base64Image}`
-                                }
-                            }
-                        ]
+                        content: contentArr
                     }
                 ],
                 max_tokens: 50
@@ -72,7 +135,7 @@ async function callModel(endpoint, key, model, base64Image, options, timeoutMs) 
     }
 }
 
-async function getBestAnswer(base64Image, options, aiSettings, botName) {
+async function getBestAnswer(base64Image, questionText, options, aiSettings, botName) {
     const models = [aiSettings.model1, aiSettings.model2, aiSettings.model3].filter(Boolean);
     if (models.length === 0) {
         addLog(`[🤖 ${botName}] ⚠️ 未配置任何 AI 模型`);
@@ -87,7 +150,7 @@ async function getBestAnswer(base64Image, options, aiSettings, botName) {
     addLog(`[🤖 ${botName}] 🚀 正在向模型 [${models.join(', ')}] 发送并发请求...`);
 
     const promises = models.map(model => 
-        callModel(aiEndpoint, aiKey, model, base64Image, options, 22000)
+        callModel(aiEndpoint, aiKey, model, base64Image, questionText, options, 22000)
         .then(ans => ({ model, ans, success: true }))
         .catch(err => ({ model, err: err.message, success: false }))
     );
@@ -105,8 +168,24 @@ async function getBestAnswer(base64Image, options, aiSettings, botName) {
     const validAnswers = results
         .filter(r => r.success && r.ans)
         .map(r => {
-            const cleaned = r.ans.trim().replace(/['"“”]/g, '');
-            return options.find(opt => cleaned.includes(opt) || opt.includes(cleaned)) || null;
+            const cleaned = r.ans.trim().replace(/['"“”`\*\.]/g, '');
+            let found = options.find(opt => opt.trim() === cleaned);
+            if (found) return found;
+
+            found = options.find(opt => opt.trim().toLowerCase() === cleaned.toLowerCase());
+            if (found) return found;
+
+            const sortedOpts = [...options].sort((a, b) => b.length - a.length);
+            for (const opt of sortedOpts) {
+                const optTrim = opt.trim();
+                if (/^\d+$/.test(optTrim)) {
+                    const numRegex = new RegExp(`(?:^|[^0-9])${optTrim}(?:[^0-9]|$)`);
+                    if (numRegex.test(cleaned)) return opt;
+                } else if (cleaned.includes(optTrim)) {
+                    return opt;
+                }
+            }
+            return null;
         })
         .filter(Boolean);
 
@@ -293,72 +372,91 @@ async function executeStepList(client, botEntity, steps, maskedPhone, displayNam
         }
         else if (step.type === 'ai_captcha') {
             let messages = await client.getMessages(botEntity, { limit: 5 });
-            let lastBotMsg = messages.find(m => !m.out);
-            if (lastBotMsg && lastBotMsg.media && lastBotMsg.replyMarkup) {
+            let lastBotMsg = messages.find(m => !m.out && m.replyMarkup);
+            if (!lastBotMsg) {
+                lastBotMsg = messages.find(m => !m.out);
+            }
+
+            if (lastBotMsg && lastBotMsg.replyMarkup) {
                 latestHandledMsgId = Math.max(latestHandledMsgId, lastBotMsg.id);
-                addLog(`[🤖 ${displayName}] ⏳ [${maskedPhone}] 正在执行 AI 识别步骤...`);
-                const currentData = loadData();
+                addLog(`[🤖 ${displayName}] ⏳ [${maskedPhone}] 正在执行验证识别步骤...`);
                 const options = [];
                 if (lastBotMsg.replyMarkup.rows) {
                     for (const row of lastBotMsg.replyMarkup.rows) {
                         for (const btn of row.buttons) {
-                            if (btn.text) options.push(btn.text);
+                            if (btn.text && btn.text.trim()) options.push(btn.text.trim());
                         }
                     }
                 }
-                if (options.length > 1) {
-                    addLog(`[🤖 ${displayName}] 🔍 正在下载验证码图片并调用 AI 求解...`);
-                    try {
-                        const buffer = await client.downloadMedia(lastBotMsg.media);
-                        if (buffer) {
-                            const base64Image = buffer.toString('base64');
-                            addLog(`[🤖 ${displayName}] 📋 验证码选项: ${options.join(', ')}`);
-                            const bestAns = await getBestAnswer(base64Image, options, currentData.aiSettings, displayName);
-                            if (bestAns) {
-                                await randomDelay(1500, 3000);
-                                addLog(`[🤖 ${displayName}] 🎯 AI 选定答案: [${bestAns}]，正在模拟点击...`);
-                                let clickRes = await clickButtonByKeywords(client, botEntity, lastBotMsg, [bestAns], displayName);
-                                
-                                let matchedPopup = false;
-                                if (clickRes.popupText && checkKeywords && checkKeywords.trim() !== "") {
-                                    const kws = checkKeywords.split(',').map(k => k.trim()).filter(k => k);
-                                    if (kws.length > 0 && kws.some(kw => clickRes.popupText.includes(kw))) {
-                                        matchedPopup = true;
-                                    }
-                                }
+                if (options.length > 0) {
+                    const questionText = lastBotMsg.text || "";
+                    let bestAns = null;
 
-                                if (matchedPopup) {
-                                    addLog(`[🤖 ${displayName}] 🎯 弹窗回复匹配到检测关键词，立即判定成功。`);
-                                    finalResultText = clickRes.popupText;
-                                    forceSuccess = true;
-                                    break;
-                                } else {
-                                    let lastMsgId = lastBotMsg.id;
-                                    let lastText = lastBotMsg.text;
-                                    let lastMarkupStr = JSON.stringify(lastBotMsg.replyMarkup);
-
-                                    let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 25000);
-                                    if (response) {
-                                        finalResultText = response.text;
-                                    } else if (clickRes.popupText) {
-                                        addLog(`[🤖 ${displayName}] ℹ️ 未收到新消息，使用弹窗回复作为检测文本。`);
-                                        finalResultText = clickRes.popupText;
-                                    } else {
-                                        finalResultText = "";
-                                    }
+                    const mathResult = solveMathExpression(questionText, options);
+                    if (mathResult) {
+                        bestAns = mathResult.answer;
+                        addLog(`[🤖 ${displayName}] 🧮 命中算术验证: [${mathResult.detail}] -> 直接匹配答案: [${bestAns}]`);
+                    } else {
+                        let base64Image = null;
+                        if (lastBotMsg.media) {
+                            addLog(`[🤖 ${displayName}] 🔍 正在下载验证码图片并调用 AI 求解...`);
+                            try {
+                                const buffer = await client.downloadMedia(lastBotMsg.media);
+                                if (buffer) {
+                                    base64Image = buffer.toString('base64');
                                 }
-                            } else {
-                                addLog(`[🤖 ${displayName}] ❌ AI 未能给出有效答案`);
+                            } catch (err) {
+                                addLog(`[🤖 ${displayName}] ⚠️ 下载验证码图片失败: ${err.message}`);
+                            }
+                        } else {
+                            addLog(`[🤖 ${displayName}] 📝 未检测到图片媒体，切换为纯文本验证题并调用 AI 求解...`);
+                        }
+                        addLog(`[🤖 ${displayName}] 📋 验证选项: ${options.join(', ')}`);
+                        const currentData = loadData();
+                        bestAns = await getBestAnswer(base64Image, questionText, options, currentData.aiSettings, displayName);
+                    }
+
+                    if (bestAns) {
+                        await randomDelay(1500, 3000);
+                        addLog(`[🤖 ${displayName}] 🎯 选定答案: [${bestAns}]，正在模拟点击...`);
+                        let clickRes = await clickButtonByKeywords(client, botEntity, lastBotMsg, [bestAns], displayName);
+                        
+                        let matchedPopup = false;
+                        if (clickRes.popupText && checkKeywords && checkKeywords.trim() !== "") {
+                            const kws = checkKeywords.split(',').map(k => k.trim()).filter(k => k);
+                            if (kws.length > 0 && kws.some(kw => clickRes.popupText.includes(kw))) {
+                                matchedPopup = true;
                             }
                         }
-                    } catch (err) {
-                        addLog(`[🤖 ${displayName}] ❌ AI 识别步骤失败: ${err.message}`);
+
+                        if (matchedPopup) {
+                            addLog(`[🤖 ${displayName}] 🎯 弹窗回复匹配到检测关键词，立即判定成功。`);
+                            finalResultText = clickRes.popupText;
+                            forceSuccess = true;
+                            break;
+                        } else {
+                            let lastMsgId = lastBotMsg.id;
+                            let lastText = lastBotMsg.text;
+                            let lastMarkupStr = JSON.stringify(lastBotMsg.replyMarkup);
+
+                            let response = await waitForBotResponse(lastMsgId, lastText, lastMarkupStr, 25000);
+                            if (response) {
+                                finalResultText = response.text;
+                            } else if (clickRes.popupText) {
+                                addLog(`[🤖 ${displayName}] ℹ️ 未收到新消息，使用弹窗回复作为检测文本。`);
+                                finalResultText = clickRes.popupText;
+                            } else {
+                                finalResultText = "";
+                            }
+                        }
+                    } else {
+                        addLog(`[🤖 ${displayName}] ❌ 未能得出有效答案`);
                     }
                 } else {
-                    addLog(`[🤖 ${displayName}] ⚠️ 验证码选项不足，跳过 AI 识别`);
+                    addLog(`[🤖 ${displayName}] ⚠️ 验证选项不足，跳过识别`);
                 }
             } else {
-                addLog(`[🤖 ${displayName}] ⚠️ 未找到包含媒体 and 按钮的最新消息，无法执行 AI 识别`);
+                addLog(`[🤖 ${displayName}] ⚠️ 未找到包含按钮的最新消息，无法执行验证识别`);
             }
         }
         else if (step.type === 'webapp' || step.type === 'webapp_json') {
