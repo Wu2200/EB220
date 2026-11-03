@@ -600,6 +600,10 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                 state.lastRetryDate = todayBj;
             }
 
+            if (isManual) {
+                state.todayRetryCount = 0;
+            }
+
             let botEntity;
             try {
                 botEntity = await client.getEntity(botUsername);
@@ -668,7 +672,7 @@ async function runCheckinForAccount(accountPhone, isManual = false, targetBotUse
                 }
             }
 
-            if (state.todayRetryCount >= 2) {
+            if (!isManual && state.todayRetryCount >= 2) {
                 addLog(`[🤖 ${displayName}] ⚠️ 今日已达到重试上限(2次)，推迟至明日再次尝试。`);
                 state.nextRunTime = getNextRandomTime(1);
                 data = loadData();
