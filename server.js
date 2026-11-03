@@ -396,7 +396,7 @@ function parseStepsFromText(stepsStr) {
             newSteps.push({ type: 'send', text: line.substring(3).trim() });
         } else if (line.startsWith('点击:')) {
             newSteps.push({ type: 'click', text: line.substring(3).trim() });
-        } else if (line.startsWith('Ai识别') || line.startsWith('AI识别')) {
+        } else if (line.startsWith('Ai识别') || line.startsWith('AI识别') || line.startsWith('验证识别') || line.startsWith('算术识别') || line.startsWith('验证码')) {
             newSteps.push({ type: 'ai_captcha' });
         } else if (line.startsWith('小程序:')) {
             let content = line.substring(4).trim();
