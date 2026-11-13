@@ -17,6 +17,7 @@ const {
     getDeviceConfig,
     getNextAvailableDeviceIndex,
     getNextRandomTime,
+    isBeijingQuietHours,
     defaultSteps,
     dataEmitter,
     initDatabase
@@ -746,13 +747,16 @@ app.post("/verify-password", async (req, res) => {
 
 let isRunning = false;
 setInterval(async () => {
-    if (isRunning) return; 
+    if (isRunning || isBeijingQuietHours()) return;
     isRunning = true;
     try {
         const data = loadData();
         for (const account of data.accounts) {
+            if (isBeijingQuietHours()) break;
             await runCheckinForAccount(account.phone, false);
         }
+    } catch (error) {
+        addLog(`❌ 定时签到轮询失败: ${error.message}`);
     } finally {
         isRunning = false;
     }
