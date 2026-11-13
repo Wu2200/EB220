@@ -392,6 +392,11 @@ function getBeijingParts(timestamp = Date.now()) {
     };
 }
 
+function isBeijingQuietHours(timestamp = Date.now()) {
+    const hour = getBeijingParts(timestamp).hour;
+    return hour >= 6 && hour < 10;
+}
+
 function getBeijingTimeAtHour(timestamp, hour) {
     const parts = getBeijingParts(timestamp);
     return Date.UTC(parts.year, parts.month, parts.day, hour, 0, 0, 0) - 8 * 60 * 60 * 1000;
@@ -545,6 +550,7 @@ module.exports = {
     getNextAvailableDeviceIndex,
     getNextRandomTime,
     getRetryTime,
+    isBeijingQuietHours,
     defaultSteps,
     dataEmitter,
     initDatabase
