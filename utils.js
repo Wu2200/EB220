@@ -106,7 +106,7 @@ const devicePool = [
         langCode: "zh-hans",
         systemLangCode: "zh-hans",
         platform: "ios",
-        userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
     },
     {
         deviceModel: "iPhone 13 Pro Max",
@@ -142,7 +142,7 @@ const devicePool = [
         langCode: "zh-hans",
         systemLangCode: "zh-hans",
         platform: "ios",
-        userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
     },
     {
         deviceModel: "iPhone 16 Pro Max",
@@ -151,7 +151,7 @@ const devicePool = [
         langCode: "zh-hans",
         systemLangCode: "zh-hans",
         platform: "ios",
-        userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
+        userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148"
     }
 ];
 
@@ -382,8 +382,56 @@ async function initDatabase() {
     }
 }
 
+function getBeijingParts(timestamp = Date.now()) {
+    const date = new Date(timestamp + 8 * 60 * 60 * 1000);
+    return {
+        year: date.getUTCFullYear(),
+        month: date.getUTCMonth(),
+        day: date.getUTCDate(),
+        hour: date.getUTCHours()
+    };
+}
+
+function getBeijingTimeAtHour(timestamp, hour) {
+    const parts = getBeijingParts(timestamp);
+    return Date.UTC(parts.year, parts.month, parts.day, hour, 0, 0, 0) - 8 * 60 * 60 * 1000;
+}
+
+function moveOutOfQuietHours(timestamp) {
+    const parts = getBeijingParts(timestamp);
+    if (parts.hour >= 6 && parts.hour < 10) {
+        return getBeijingTimeAtHour(timestamp, 10);
+    }
+    return timestamp;
+}
+
+function applyQuietHoursToDueTasks(data, now = Date.now()) {
+    const parts = getBeijingParts(now);
+    if (parts.hour < 6 || parts.hour >= 10 || !Array.isArray(data.bots)) {
+        return false;
+    }
+
+    const resumeAt = getBeijingTimeAtHour(now, 10);
+    let changed = false;
+    for (const bot of data.bots) {
+        if (!bot || !bot.states || typeof bot.states !== 'object') continue;
+        for (const state of Object.values(bot.states)) {
+            if (!state) continue;
+            const nextRunTime = Number(state.nextRunTime);
+            if (Number.isFinite(nextRunTime) && nextRunTime <= now) {
+                state.nextRunTime = resumeAt;
+                changed = true;
+            }
+        }
+    }
+    return changed;
+}
+
 function loadData() {
     if (globalData) {
+        if (applyQuietHoursToDueTasks(globalData)) {
+            saveData(globalData);
+        }
         return globalData;
     }
 
@@ -404,7 +452,8 @@ function loadData() {
     const normalized = normalizeData(data);
     globalData = normalized.data;
 
-    if (normalized.hasMigrated) {
+    const quietHoursChanged = applyQuietHoursToDueTasks(globalData);
+    if (normalized.hasMigrated || quietHoursChanged) {
         saveData(globalData);
     }
 
@@ -447,7 +496,7 @@ function getNextRandomTime(days = 1) {
     
     const targetBjMs = Date.UTC(bjDate.getUTCFullYear(), bjDate.getUTCMonth(), bjDate.getUTCDate() + stepDays);
     
-    const minTimeBjMs = targetBjMs + 8 * 60 * 60 * 1000;
+    const minTimeBjMs = targetBjMs + 10 * 60 * 60 * 1000;
     const maxTimeBjMs = targetBjMs + 23.5 * 60 * 60 * 1000;
     
     const randomBjMs = Math.floor(Math.random() * (maxTimeBjMs - minTimeBjMs)) + minTimeBjMs;
@@ -478,7 +527,7 @@ function getRetryTime() {
         return today2300Ms + randomOffsetMs;
     }
 
-    return now + sixHoursMs;
+    return moveOutOfQuietHours(now + sixHoursMs);
 }
 
 module.exports = {
